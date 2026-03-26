@@ -1,0 +1,36 @@
+project:
+  name: clarity_nlp_project
+  seed: 42
+
+dataset:
+  source: "huggingface"
+  name: "ailsntua/QEvasion"
+  text_column: "question"
+  label_column: "clarity_label"
+  num_labels: null
+
+preprocessing:
+  lowercase: true
+  remove_extra_spaces: true
+
+tokenizer:
+  model_name: "microsoft/deberta-v3-base"
+  max_length: 256
+  padding: "max_length"
+  truncation: true
+
+model:
+  name: "microsoft/deberta-v3-base"
+  num_labels: null
+
+training:
+  batch_size: 16
+  epochs: 3
+  learning_rate: 2e-5
+  weight_decay: 0.01
+
+paths:
+  data_dir: "data/"
+  processed_dir: "data/processed/"
+  reports_dir: "reports/"
+  models_dir: "models/"
