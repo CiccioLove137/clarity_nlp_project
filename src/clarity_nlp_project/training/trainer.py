@@ -28,7 +28,7 @@ def train_model(config, model, tokenized_dataset):
         per_device_eval_batch_size=config["training"]["batch_size"],
         num_train_epochs=config["training"]["epochs"],
         weight_decay=config["training"]["weight_decay"],
-        evaluation_strategy="epoch",
+        eval_strategy="epoch",
         save_strategy="epoch",
         logging_dir=config["paths"]["reports_dir"],
         load_best_model_at_end=True,
