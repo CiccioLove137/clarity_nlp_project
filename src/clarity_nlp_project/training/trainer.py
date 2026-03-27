@@ -24,6 +24,32 @@ def _get_attr(config: Any, path: str, default: Any = None) -> Any:
     return default if current is None else current
 
 
+def _to_float(value: Any, default: float) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def _to_int(value: Any, default: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return int(default)
+
+
+def _to_bool(value: Any, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        v = value.strip().lower()
+        if v in {"true", "1", "yes", "y"}:
+            return True
+        if v in {"false", "0", "no", "n"}:
+            return False
+    return default
+
+
 def _compute_metrics(eval_pred):
     logits, labels = eval_pred
     preds = np.argmax(logits, axis=-1)
@@ -32,17 +58,20 @@ def _compute_metrics(eval_pred):
 
 
 def train_model(config: Any, model, tokenized_dataset):
-
     model_name = _get_attr(config, "model.name", "microsoft/deberta-v3-base")
     output_dir = _get_attr(config, "training.output_dir", "outputs")
-    learning_rate = _get_attr(config, "training.learning_rate", 2e-5)
-    train_batch_size = _get_attr(config, "training.per_device_train_batch_size", 8)
-    eval_batch_size = _get_attr(config, "training.per_device_eval_batch_size", 8)
-    num_train_epochs = _get_attr(config, "training.num_train_epochs", 3)
+
+    learning_rate = _to_float(_get_attr(config, "training.learning_rate", 2e-5), 2e-5)
+    train_batch_size = _to_int(_get_attr(config, "training.per_device_train_batch_size", 8), 8)
+    eval_batch_size = _to_int(_get_attr(config, "training.per_device_eval_batch_size", 8), 8)
+    num_train_epochs = _to_int(_get_attr(config, "training.num_train_epochs", 3), 3)
+    fp16 = _to_bool(_get_attr(config, "training.fp16", False), False)
 
     os.makedirs(output_dir, exist_ok=True)
 
-    # dataset
+    if "train" not in tokenized_dataset:
+        raise ValueError("tokenized_dataset must contain a 'train' split.")
+
     train_dataset = tokenized_dataset["train"]
 
     if "validation" in tokenized_dataset:
@@ -55,11 +84,18 @@ def train_model(config: Any, model, tokenized_dataset):
         eval_dataset = None
         eval_strategy = "no"
 
-    # tokenizer + collator
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     data_collator = DataCollatorWithPadding(tokenizer=tokenizer)
 
-    # training args (SUPER COMPATIBILI)
+    print("\n[INFO] Training configuration:")
+    print(f"model_name = {model_name}")
+    print(f"output_dir = {output_dir}")
+    print(f"learning_rate = {learning_rate} ({type(learning_rate).__name__})")
+    print(f"train_batch_size = {train_batch_size} ({type(train_batch_size).__name__})")
+    print(f"eval_batch_size = {eval_batch_size} ({type(eval_batch_size).__name__})")
+    print(f"num_train_epochs = {num_train_epochs} ({type(num_train_epochs).__name__})")
+    print(f"fp16 = {fp16} ({type(fp16).__name__})")
+
     training_args = TrainingArguments(
         output_dir=output_dir,
         do_train=True,
@@ -71,9 +107,9 @@ def train_model(config: Any, model, tokenized_dataset):
         num_train_epochs=num_train_epochs,
         logging_strategy="epoch",
         report_to="none",
+        fp16=fp16,
     )
 
-    # trainer (API aggiornata)
     trainer = Trainer(
         model=model,
         args=training_args,
@@ -84,17 +120,14 @@ def train_model(config: Any, model, tokenized_dataset):
         compute_metrics=_compute_metrics if eval_dataset is not None else None,
     )
 
-    # train
     trainer.train()
 
-    # eval
     if eval_dataset is not None:
         metrics = trainer.evaluate()
         print("\n[INFO] Evaluation metrics:")
         for k, v in metrics.items():
             print(f"{k}: {v}")
 
-    # save
     trainer.save_model(output_dir)
     tokenizer.save_pretrained(output_dir)
 
