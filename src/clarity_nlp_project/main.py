@@ -105,6 +105,31 @@ def convert_split(raw_split) -> Dataset:
     )
 
 
+def tokenize_split(split_dataset: Dataset, tokenizer, label2id: dict[str, int], max_length: int) -> Dataset:
+    texts = split_dataset["text"]
+    raw_labels = split_dataset["label"]
+
+    encoded = tokenizer(
+        texts,
+        truncation=True,
+        padding=False,
+        max_length=max_length,
+    )
+
+    labels = [label2id[label] for label in raw_labels]
+
+    data = {
+        "input_ids": encoded["input_ids"],
+        "attention_mask": encoded["attention_mask"],
+        "labels": labels,
+    }
+
+    if "token_type_ids" in encoded:
+        data["token_type_ids"] = encoded["token_type_ids"]
+
+    return Dataset.from_dict(data)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -181,49 +206,14 @@ def main() -> None:
     print("\n[INFO] Loading tokenizer...")
     tokenizer = AutoTokenizer.from_pretrained(model_name)
 
-    def preprocess_function(examples):
-        texts = examples["text"]
-        raw_labels = examples["label"]
+    print("\n[INFO] Tokenizing train split...")
+    tokenized_train = tokenize_split(dataset["train"], tokenizer, label2id, max_length)
 
-        tokenized = tokenizer(
-            texts,
-            truncation=True,
-            padding=False,
-            max_length=max_length,
-        )
+    print("\n[INFO] Tokenizing validation split...")
+    tokenized_validation = tokenize_split(dataset["validation"], tokenizer, label2id, max_length)
 
-        labels = []
-        for l in raw_labels:
-            if l in label2id:
-                labels.append(label2id[l])
-            else:
-                labels.append(-100)
-
-        tokenized["labels"] = labels
-        return tokenized
-
-    print("\n[INFO] Tokenizing dataset split by split...")
-
-    tokenized_train = dataset["train"].map(
-        preprocess_function,
-        batched=True,
-        load_from_cache_file=False,
-        desc="Tokenizing train",
-    )
-
-    tokenized_validation = dataset["validation"].map(
-        preprocess_function,
-        batched=True,
-        load_from_cache_file=False,
-        desc="Tokenizing validation",
-    )
-
-    tokenized_test = dataset["test"].map(
-        preprocess_function,
-        batched=True,
-        load_from_cache_file=False,
-        desc="Tokenizing test",
-    )
+    print("\n[INFO] Tokenizing test split...")
+    tokenized_test = tokenize_split(dataset["test"], tokenizer, label2id, max_length)
 
     tokenized_dataset = DatasetDict(
         {
@@ -233,49 +223,19 @@ def main() -> None:
         }
     )
 
-    print("\n[DEBUG] Tokenized train columns BEFORE cleaning:")
+    print("\n[DEBUG] Tokenized train columns:")
     print(tokenized_dataset["train"].column_names)
 
-    print("\n[DEBUG] Tokenized validation columns BEFORE cleaning:")
+    print("\n[DEBUG] Tokenized validation columns:")
     print(tokenized_dataset["validation"].column_names)
 
-    print("\n[DEBUG] Tokenized test columns BEFORE cleaning:")
-    print(tokenized_dataset["test"].column_names)
-
-    print("\n[DEBUG] Checking TEST labels presence BEFORE cleaning:")
-    print("labels in test:", "labels" in tokenized_dataset["test"].column_names)
-
-    allowed_columns = {"input_ids", "attention_mask", "token_type_ids", "labels"}
-
-    clean_tokenized_dataset = {}
-
-    for split_name, split_dataset in tokenized_dataset.items():
-        if "labels" in split_dataset.column_names:
-            columns_to_remove = [c for c in split_dataset.column_names if c not in allowed_columns]
-            clean_split = split_dataset.remove_columns(columns_to_remove)
-        else:
-            clean_split = split_dataset
-        clean_tokenized_dataset[split_name] = clean_split
-
-    tokenized_dataset = DatasetDict(clean_tokenized_dataset)
-
-    print("\n[DEBUG] Tokenized train columns AFTER cleaning:")
-    print(tokenized_dataset["train"].column_names)
-
-    print("\n[DEBUG] Tokenized validation columns AFTER cleaning:")
-    print(tokenized_dataset["validation"].column_names)
-
-    print("\n[DEBUG] Tokenized test columns AFTER cleaning:")
+    print("\n[DEBUG] Tokenized test columns:")
     print(tokenized_dataset["test"].column_names)
 
     print("\n[DEBUG] Tokenized label ids:")
     print("train:", set(tokenized_dataset["train"]["labels"]))
     print("validation:", set(tokenized_dataset["validation"]["labels"]))
-
-    if "labels" in tokenized_dataset["test"].column_names:
-        print("test:", set(tokenized_dataset["test"]["labels"]))
-    else:
-        print("test: ⚠️ labels column missing")
+    print("test:", set(tokenized_dataset["test"]["labels"]))
 
     num_labels = len(label2id)
 
@@ -293,17 +253,7 @@ def main() -> None:
     trainer = train_model(config, model, tokenized_dataset)
 
     print("\n[INFO] Running final evaluation on TEST set...")
-    test_eval_dataset = tokenized_dataset["test"]
-
-    if "labels" not in test_eval_dataset.column_names:
-        raise ValueError(
-            f"TEST split has no 'labels' column. Available columns: {test_eval_dataset.column_names}"
-        )
-
-    print("[DEBUG] TEST columns used for final evaluation:")
-    print(test_eval_dataset.column_names)
-
-    test_metrics = trainer.evaluate(eval_dataset=test_eval_dataset)
+    test_metrics = trainer.evaluate(eval_dataset=tokenized_dataset["test"])
 
     print("\n[INFO] Final TEST metrics:")
     for key, value in test_metrics.items():
