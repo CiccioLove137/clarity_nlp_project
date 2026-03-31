@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import argparse
 import random
+import re
 from typing import Any
 
 import numpy as np
 import torch
 import yaml
-from datasets import load_dataset
+from datasets import Dataset, DatasetDict, load_dataset
 from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
 from src.clarity_nlp_project.data.splits import (
@@ -41,6 +42,75 @@ def set_seed(seed: int = 42) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
+def extract_3class_label(prediction_text: str) -> str | None:
+    """
+    Convert gpt3.5_prediction text into 3 final classes:
+    - Clear Reply
+    - Ambivalent
+    - Clear Non-Reply
+    """
+    if prediction_text is None:
+        return None
+
+    text = str(prediction_text).lower()
+
+    # 1.x => reply
+    if "verdict: 1.1" in text or "explicit" in text:
+        return "Clear Reply"
+
+    if "verdict: 1.2" in text or "implicit" in text:
+        return "Clear Reply"
+
+    # 2.3 => ambivalent
+    if "verdict: 2.3" in text or "partial/half-answer" in text or "partial answer" in text:
+        return "Ambivalent"
+
+    # 2.1 / 2.4 => clear non-reply
+    if "verdict: 2.1" in text or "dodging" in text:
+        return "Clear Non-Reply"
+
+    if "verdict: 2.4" in text or "general" in text:
+        return "Clear Non-Reply"
+
+    # optional fallback for unexpected variants
+    if "non-reply" in text:
+        return "Clear Non-Reply"
+
+    return None
+
+
+def build_text(example: dict[str, Any]) -> str:
+    question = str(example.get("interview_question", "")).strip()
+    answer = str(example.get("interview_answer", "")).strip()
+
+    return f"Question: {question}\nAnswer: {answer}"
+
+
+def convert_split(raw_split) -> Dataset:
+    texts = []
+    labels = []
+
+    for ex in raw_split:
+        label = extract_3class_label(ex.get("gpt3.5_prediction"))
+        text = build_text(ex)
+
+        if label is None:
+            continue
+
+        if text.strip() == "":
+            continue
+
+        texts.append(text)
+        labels.append(label)
+
+    return Dataset.from_dict(
+        {
+            "text": texts,
+            "label": labels,
+        }
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -61,34 +131,43 @@ def main() -> None:
     model_name = get_cfg(config, "model.name", "microsoft/deberta-v3-base")
     max_length = int(get_cfg(config, "dataset.max_length", 256))
     val_size = float(get_cfg(config, "dataset.val_size", 0.1))
-    text_column = get_cfg(config, "dataset.text_column", "text")
-    label_column = get_cfg(config, "dataset.label_column", "label")
 
-    print("\n[INFO] Loading dataset...")
+    print("\n[INFO] Loading raw dataset...")
     if dataset_config_name:
-        dataset = load_dataset(dataset_name, dataset_config_name)
+        raw_dataset = load_dataset(dataset_name, dataset_config_name)
     else:
-        dataset = load_dataset(dataset_name)
+        raw_dataset = load_dataset(dataset_name)
 
-    print("\n[INFO] Original dataset:")
-    print(dataset)
+    print("\n[INFO] Raw dataset:")
+    print(raw_dataset)
+
+    print("\n[INFO] Converting raw dataset into clean text/label format...")
+    clean_dataset = DatasetDict(
+        {
+            "train": convert_split(raw_dataset["train"]),
+            "test": convert_split(raw_dataset["test"]),
+        }
+    )
+
+    print("\n[INFO] Clean dataset:")
+    print(clean_dataset)
 
     print("\n[INFO] Creating train/validation/test split...")
     dataset = make_train_val_test_splits(
-    dataset,
-    label_column=label_column,
-    val_size=val_size,
-    seed=seed,
+        clean_dataset,
+        label_column="label",
+        val_size=val_size,
+        seed=seed,
     )
 
-    print_split_info(dataset, "train", label_column)
-    print_split_info(dataset, "validation", label_column)
-    print_split_info(dataset, "test", label_column)
+    print_split_info(dataset, "train", "label")
+    print_split_info(dataset, "validation", "label")
+    print_split_info(dataset, "test", "label")
 
     print("\n[INFO] Building label mappings...")
-    all_labels = sorted(set(dataset["train"][label_column]) | set(dataset["validation"][label_column]) | set(dataset["test"][label_column]))
-    label2id = {label: idx for idx, label in enumerate(all_labels)}
-    id2label = {idx: str(label) for label, idx in label2id.items()}
+    unique_labels = sorted(set(dataset["train"]["label"]) | set(dataset["validation"]["label"]) | set(dataset["test"]["label"]))
+    label2id = {label: idx for idx, label in enumerate(unique_labels)}
+    id2label = {idx: label for label, idx in label2id.items()}
 
     print(f"[INFO] label2id: {label2id}")
     print(f"[INFO] id2label: {id2label}")
@@ -97,16 +176,13 @@ def main() -> None:
     tokenizer = AutoTokenizer.from_pretrained(model_name)
 
     def preprocess_function(examples):
-        texts = examples[text_column]
-        labels = [label2id[label] for label in examples[label_column]]
-
         tokenized = tokenizer(
-            texts,
+            examples["text"],
             truncation=True,
             padding=False,
             max_length=max_length,
         )
-        tokenized["label"] = labels
+        tokenized["label"] = [label2id[label] for label in examples["label"]]
         return tokenized
 
     print("\n[INFO] Tokenizing dataset...")
@@ -127,7 +203,7 @@ def main() -> None:
         model_name,
         num_labels=num_labels,
         id2label=id2label,
-        label2id={str(k): v for k, v in label2id.items()},
+        label2id=label2id,
     )
 
     print("[INFO] Model loaded successfully!")
