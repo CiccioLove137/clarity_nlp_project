@@ -74,11 +74,16 @@ def main() -> None:
     print(dataset)
 
     print("\n[INFO] Creating train/validation/test split...")
-    dataset = make_train_val_test_splits(dataset, val_size=val_size, seed=seed)
+    dataset = make_train_val_test_splits(
+    dataset,
+    label_column=label_column,
+    val_size=val_size,
+    seed=seed,
+    )
 
-    print_split_info(dataset, "train")
-    print_split_info(dataset, "validation")
-    print_split_info(dataset, "test")
+    print_split_info(dataset, "train", label_column)
+    print_split_info(dataset, "validation", label_column)
+    print_split_info(dataset, "test", label_column)
 
     print("\n[INFO] Building label mappings...")
     all_labels = sorted(set(dataset["train"][label_column]) | set(dataset["validation"][label_column]) | set(dataset["test"][label_column]))

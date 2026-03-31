@@ -5,12 +5,18 @@ from datasets import DatasetDict
 from sklearn.model_selection import train_test_split
 
 
-def make_train_val_test_splits(dataset_dict: DatasetDict, val_size: float = 0.1, seed: int = 42) -> DatasetDict:
+def make_train_val_test_splits(
+    dataset_dict: DatasetDict,
+    label_column: str,
+    val_size: float = 0.1,
+    seed: int = 42,
+) -> DatasetDict:
     """
     Split the original train set into train + validation, keeping the original test set untouched.
 
     Args:
         dataset_dict: Hugging Face DatasetDict with at least 'train' and 'test'
+        label_column: name of the label column in the raw dataset
         val_size: fraction of original train to use as validation
         seed: random seed
 
@@ -25,7 +31,13 @@ def make_train_val_test_splits(dataset_dict: DatasetDict, val_size: float = 0.1,
     train_full = dataset_dict["train"]
     test_set = dataset_dict["test"]
 
-    labels = np.array(train_full["label"])
+    if label_column not in train_full.column_names:
+        raise ValueError(
+            f"Label column '{label_column}' does not exist. "
+            f"Available columns: {train_full.column_names}"
+        )
+
+    labels = np.array(train_full[label_column])
     indices = np.arange(len(train_full))
 
     train_idx, val_idx = train_test_split(
@@ -47,14 +59,22 @@ def make_train_val_test_splits(dataset_dict: DatasetDict, val_size: float = 0.1,
     )
 
 
-def print_split_info(dataset_dict: DatasetDict, split_name: str) -> None:
+def print_split_info(dataset_dict: DatasetDict, split_name: str, label_column: str) -> None:
     split = dataset_dict[split_name]
-    labels = np.array(split["label"])
+
+    if label_column not in split.column_names:
+        raise ValueError(
+            f"Label column '{label_column}' does not exist in split '{split_name}'. "
+            f"Available columns: {split.column_names}"
+        )
+
+    labels = np.array(split[label_column])
 
     unique, counts = np.unique(labels, return_counts=True)
 
     print(f"\n[INFO] Split: {split_name}")
     print(f"num_rows = {len(split)}")
+    print(f"label_column = {label_column}")
     print("label_distribution =")
     for label, count in zip(unique, counts):
         pct = 100.0 * count / len(split)
