@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import random
-import re
 from typing import Any
 
 import numpy as np
@@ -44,7 +43,7 @@ def set_seed(seed: int = 42) -> None:
 
 def extract_3class_label(prediction_text: str) -> str | None:
     """
-    Convert gpt3.5_prediction text into 3 final classes:
+    Map raw GPT verdict text to 3 final classes:
     - Clear Reply
     - Ambivalent
     - Clear Non-Reply
@@ -54,25 +53,25 @@ def extract_3class_label(prediction_text: str) -> str | None:
 
     text = str(prediction_text).lower()
 
-    # 1.x => reply
+    # Reply
     if "verdict: 1.1" in text or "explicit" in text:
         return "Clear Reply"
 
     if "verdict: 1.2" in text or "implicit" in text:
         return "Clear Reply"
 
-    # 2.3 => ambivalent
+    # Ambivalent
     if "verdict: 2.3" in text or "partial/half-answer" in text or "partial answer" in text:
         return "Ambivalent"
 
-    # 2.1 / 2.4 => clear non-reply
+    # Clear Non-Reply
     if "verdict: 2.1" in text or "dodging" in text:
         return "Clear Non-Reply"
 
     if "verdict: 2.4" in text or "general" in text:
         return "Clear Non-Reply"
 
-    # optional fallback for unexpected variants
+    # Fallback
     if "non-reply" in text:
         return "Clear Non-Reply"
 
@@ -82,7 +81,6 @@ def extract_3class_label(prediction_text: str) -> str | None:
 def build_text(example: dict[str, Any]) -> str:
     question = str(example.get("interview_question", "")).strip()
     answer = str(example.get("interview_answer", "")).strip()
-
     return f"Question: {question}\nAnswer: {answer}"
 
 
@@ -97,7 +95,7 @@ def convert_split(raw_split) -> Dataset:
         if label is None:
             continue
 
-        if text.strip() == "":
+        if not text.strip():
             continue
 
         texts.append(text)
@@ -164,8 +162,20 @@ def main() -> None:
     print_split_info(dataset, "validation", "label")
     print_split_info(dataset, "test", "label")
 
+    print("\n[INFO] Checking empty texts...")
+    empty_train = sum(1 for x in dataset["train"]["text"] if not str(x).strip())
+    empty_val = sum(1 for x in dataset["validation"]["text"] if not str(x).strip())
+    empty_test = sum(1 for x in dataset["test"]["text"] if not str(x).strip())
+    print(f"empty_train: {empty_train}")
+    print(f"empty_validation: {empty_val}")
+    print(f"empty_test: {empty_test}")
+
     print("\n[INFO] Building label mappings...")
-    unique_labels = sorted(set(dataset["train"]["label"]) | set(dataset["validation"]["label"]) | set(dataset["test"]["label"]))
+    unique_labels = sorted(
+        set(dataset["train"]["label"])
+        | set(dataset["validation"]["label"])
+        | set(dataset["test"]["label"])
+    )
     label2id = {label: idx for idx, label in enumerate(unique_labels)}
     id2label = {idx: label for label, idx in label2id.items()}
 
@@ -182,18 +192,29 @@ def main() -> None:
             padding=False,
             max_length=max_length,
         )
-        tokenized["label"] = [label2id[label] for label in examples["label"]]
+        tokenized["labels"] = [label2id[label] for label in examples["label"]]
         return tokenized
 
     print("\n[INFO] Tokenizing dataset...")
     tokenized_dataset = dataset.map(
-    preprocess_function,
-    batched=True,
+        preprocess_function,
+        batched=True,
+        desc="Tokenizing dataset",
     )
-    print("\n[DEBUG] Columns after tokenization:")
+
+    print("\n[DEBUG] Tokenized train columns:")
     print(tokenized_dataset["train"].column_names)
-    print("\n[INFO] Tokenized dataset:")
-    print(tokenized_dataset)
+
+    print("\n[DEBUG] Tokenized validation columns:")
+    print(tokenized_dataset["validation"].column_names)
+
+    print("\n[DEBUG] Tokenized test columns:")
+    print(tokenized_dataset["test"].column_names)
+
+    print("\n[DEBUG] Tokenized label ids:")
+    print("train:", set(tokenized_dataset["train"]["labels"]))
+    print("validation:", set(tokenized_dataset["validation"]["labels"]))
+    print("test:", set(tokenized_dataset["test"]["labels"]))
 
     num_labels = len(label2id)
 
@@ -211,7 +232,18 @@ def main() -> None:
     trainer = train_model(config, model, tokenized_dataset)
 
     print("\n[INFO] Running final evaluation on TEST set...")
-    test_metrics = trainer.evaluate(eval_dataset=tokenized_dataset["test"])
+    test_eval_dataset = tokenized_dataset["test"]
+
+    allowed_columns = {"input_ids", "attention_mask", "token_type_ids", "labels"}
+    columns_to_remove = [c for c in test_eval_dataset.column_names if c not in allowed_columns]
+
+    if columns_to_remove:
+        test_eval_dataset = test_eval_dataset.remove_columns(columns_to_remove)
+
+    print("[DEBUG] TEST columns used for final evaluation:")
+    print(test_eval_dataset.column_names)
+
+    test_metrics = trainer.evaluate(eval_dataset=test_eval_dataset)
 
     print("\n[INFO] Final TEST metrics:")
     for key, value in test_metrics.items():
