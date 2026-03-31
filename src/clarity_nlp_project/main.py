@@ -187,12 +187,11 @@ def main() -> None:
 
     print("\n[INFO] Tokenizing dataset...")
     tokenized_dataset = dataset.map(
-        preprocess_function,
-        batched=True,
-        remove_columns=dataset["train"].column_names,
-        desc="Tokenizing dataset",
+    preprocess_function,
+    batched=True,
     )
-
+    print("\n[DEBUG] Columns after tokenization:")
+    print(tokenized_dataset["train"].column_names)
     print("\n[INFO] Tokenized dataset:")
     print(tokenized_dataset)
 
