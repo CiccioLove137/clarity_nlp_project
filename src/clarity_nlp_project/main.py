@@ -106,8 +106,20 @@ def convert_split(raw_split) -> Dataset:
 
 
 def tokenize_split(split_dataset: Dataset, tokenizer, label2id: dict[str, int], max_length: int) -> Dataset:
-    texts = split_dataset["text"]
-    raw_labels = split_dataset["label"]
+    texts = []
+    labels = []
+
+    for text, label in zip(split_dataset["text"], split_dataset["label"]):
+        text = str(text) if text is not None else ""
+
+        if not text.strip():
+            continue
+
+        if label not in label2id:
+            continue
+
+        texts.append(text)
+        labels.append(label2id[label])
 
     encoded = tokenizer(
         texts,
@@ -115,8 +127,6 @@ def tokenize_split(split_dataset: Dataset, tokenizer, label2id: dict[str, int], 
         padding=False,
         max_length=max_length,
     )
-
-    labels = [label2id[label] for label in raw_labels]
 
     data = {
         "input_ids": encoded["input_ids"],
