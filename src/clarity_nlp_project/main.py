@@ -195,11 +195,35 @@ def main() -> None:
         tokenized["labels"] = [label2id[label] for label in examples["label"]]
         return tokenized
 
-    print("\n[INFO] Tokenizing dataset...")
-    tokenized_dataset = dataset.map(
+    print("\n[INFO] Tokenizing dataset split by split...")
+
+    tokenized_train = dataset["train"].map(
         preprocess_function,
         batched=True,
-        desc="Tokenizing dataset",
+        load_from_cache_file=False,
+        desc="Tokenizing train",
+    )
+
+    tokenized_validation = dataset["validation"].map(
+        preprocess_function,
+        batched=True,
+        load_from_cache_file=False,
+        desc="Tokenizing validation",
+    )
+
+    tokenized_test = dataset["test"].map(
+        preprocess_function,
+        batched=True,
+        load_from_cache_file=False,
+        desc="Tokenizing test",
+    )
+
+    tokenized_dataset = DatasetDict(
+        {
+            "train": tokenized_train,
+            "validation": tokenized_validation,
+            "test": tokenized_test,
+        }
     )
 
     print("\n[DEBUG] Tokenized train columns:")
@@ -214,7 +238,11 @@ def main() -> None:
     print("\n[DEBUG] Tokenized label ids:")
     print("train:", set(tokenized_dataset["train"]["labels"]))
     print("validation:", set(tokenized_dataset["validation"]["labels"]))
-    print("test:", set(tokenized_dataset["test"]["labels"]))
+
+    if "labels" in tokenized_dataset["test"].column_names:
+        print("test:", set(tokenized_dataset["test"]["labels"]))
+    else:
+        print("test: ⚠️ labels column missing")
 
     num_labels = len(label2id)
 
