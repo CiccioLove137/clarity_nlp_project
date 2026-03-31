@@ -182,13 +182,24 @@ def main() -> None:
     tokenizer = AutoTokenizer.from_pretrained(model_name)
 
     def preprocess_function(examples):
+        texts = examples["text"]
+        raw_labels = examples["label"]
+
         tokenized = tokenizer(
-            examples["text"],
+            texts,
             truncation=True,
             padding=False,
             max_length=max_length,
         )
-        tokenized["labels"] = [label2id[label] for label in examples["label"]]
+
+        labels = []
+        for l in raw_labels:
+            if l in label2id:
+                labels.append(label2id[l])
+            else:
+                labels.append(-100)
+
+        tokenized["labels"] = labels
         return tokenized
 
     print("\n[INFO] Tokenizing dataset split by split...")
@@ -231,13 +242,19 @@ def main() -> None:
     print("\n[DEBUG] Tokenized test columns BEFORE cleaning:")
     print(tokenized_dataset["test"].column_names)
 
+    print("\n[DEBUG] Checking TEST labels presence BEFORE cleaning:")
+    print("labels in test:", "labels" in tokenized_dataset["test"].column_names)
+
     allowed_columns = {"input_ids", "attention_mask", "token_type_ids", "labels"}
 
     clean_tokenized_dataset = {}
 
     for split_name, split_dataset in tokenized_dataset.items():
-        columns_to_remove = [c for c in split_dataset.column_names if c not in allowed_columns]
-        clean_split = split_dataset.remove_columns(columns_to_remove)
+        if "labels" in split_dataset.column_names:
+            columns_to_remove = [c for c in split_dataset.column_names if c not in allowed_columns]
+            clean_split = split_dataset.remove_columns(columns_to_remove)
+        else:
+            clean_split = split_dataset
         clean_tokenized_dataset[split_name] = clean_split
 
     tokenized_dataset = DatasetDict(clean_tokenized_dataset)
@@ -254,7 +271,11 @@ def main() -> None:
     print("\n[DEBUG] Tokenized label ids:")
     print("train:", set(tokenized_dataset["train"]["labels"]))
     print("validation:", set(tokenized_dataset["validation"]["labels"]))
-    print("test:", set(tokenized_dataset["test"]["labels"]))
+
+    if "labels" in tokenized_dataset["test"].column_names:
+        print("test:", set(tokenized_dataset["test"]["labels"]))
+    else:
+        print("test: ⚠️ labels column missing")
 
     num_labels = len(label2id)
 
@@ -273,6 +294,11 @@ def main() -> None:
 
     print("\n[INFO] Running final evaluation on TEST set...")
     test_eval_dataset = tokenized_dataset["test"]
+
+    if "labels" not in test_eval_dataset.column_names:
+        raise ValueError(
+            f"TEST split has no 'labels' column. Available columns: {test_eval_dataset.column_names}"
+        )
 
     print("[DEBUG] TEST columns used for final evaluation:")
     print(test_eval_dataset.column_names)
