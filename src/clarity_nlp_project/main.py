@@ -53,25 +53,21 @@ def extract_3class_label(prediction_text: str) -> str | None:
 
     text = str(prediction_text).lower()
 
-    # Reply
     if "verdict: 1.1" in text or "explicit" in text:
         return "Clear Reply"
 
     if "verdict: 1.2" in text or "implicit" in text:
         return "Clear Reply"
 
-    # Ambivalent
     if "verdict: 2.3" in text or "partial/half-answer" in text or "partial answer" in text:
         return "Ambivalent"
 
-    # Clear Non-Reply
     if "verdict: 2.1" in text or "dodging" in text:
         return "Clear Non-Reply"
 
     if "verdict: 2.4" in text or "general" in text:
         return "Clear Non-Reply"
 
-    # Fallback
     if "non-reply" in text:
         return "Clear Non-Reply"
 
@@ -226,23 +222,39 @@ def main() -> None:
         }
     )
 
-    print("\n[DEBUG] Tokenized train columns:")
+    print("\n[DEBUG] Tokenized train columns BEFORE cleaning:")
     print(tokenized_dataset["train"].column_names)
 
-    print("\n[DEBUG] Tokenized validation columns:")
+    print("\n[DEBUG] Tokenized validation columns BEFORE cleaning:")
     print(tokenized_dataset["validation"].column_names)
 
-    print("\n[DEBUG] Tokenized test columns:")
+    print("\n[DEBUG] Tokenized test columns BEFORE cleaning:")
+    print(tokenized_dataset["test"].column_names)
+
+    allowed_columns = {"input_ids", "attention_mask", "token_type_ids", "labels"}
+
+    clean_tokenized_dataset = {}
+
+    for split_name, split_dataset in tokenized_dataset.items():
+        columns_to_remove = [c for c in split_dataset.column_names if c not in allowed_columns]
+        clean_split = split_dataset.remove_columns(columns_to_remove)
+        clean_tokenized_dataset[split_name] = clean_split
+
+    tokenized_dataset = DatasetDict(clean_tokenized_dataset)
+
+    print("\n[DEBUG] Tokenized train columns AFTER cleaning:")
+    print(tokenized_dataset["train"].column_names)
+
+    print("\n[DEBUG] Tokenized validation columns AFTER cleaning:")
+    print(tokenized_dataset["validation"].column_names)
+
+    print("\n[DEBUG] Tokenized test columns AFTER cleaning:")
     print(tokenized_dataset["test"].column_names)
 
     print("\n[DEBUG] Tokenized label ids:")
     print("train:", set(tokenized_dataset["train"]["labels"]))
     print("validation:", set(tokenized_dataset["validation"]["labels"]))
-
-    if "labels" in tokenized_dataset["test"].column_names:
-        print("test:", set(tokenized_dataset["test"]["labels"]))
-    else:
-        print("test: ⚠️ labels column missing")
+    print("test:", set(tokenized_dataset["test"]["labels"]))
 
     num_labels = len(label2id)
 
@@ -261,12 +273,6 @@ def main() -> None:
 
     print("\n[INFO] Running final evaluation on TEST set...")
     test_eval_dataset = tokenized_dataset["test"]
-
-    allowed_columns = {"input_ids", "attention_mask", "token_type_ids", "labels"}
-    columns_to_remove = [c for c in test_eval_dataset.column_names if c not in allowed_columns]
-
-    if columns_to_remove:
-        test_eval_dataset = test_eval_dataset.remove_columns(columns_to_remove)
 
     print("[DEBUG] TEST columns used for final evaluation:")
     print(test_eval_dataset.column_names)
