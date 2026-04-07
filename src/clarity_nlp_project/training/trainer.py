@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 from typing import Any
 
@@ -8,6 +9,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from sklearn.metrics import accuracy_score, precision_recall_fscore_support
+from torch.utils.data import DataLoader, WeightedRandomSampler
 from transformers import (
     AutoTokenizer,
     DataCollatorWithPadding,
@@ -52,19 +54,6 @@ def _to_bool(value: Any, default: bool = False) -> bool:
         if v in {"false", "0", "no", "n"}:
             return False
     return default
-
-
-def compute_class_weights_from_labels(labels: list[int], num_classes: int) -> torch.Tensor:
-    counts = np.bincount(labels, minlength=num_classes).astype(np.float32)
-
-    if np.any(counts == 0):
-        counts = np.where(counts == 0, 1.0, counts)
-
-    total = counts.sum()
-    weights = total / (num_classes * counts)
-    weights = weights / weights.mean()
-
-    return torch.tensor(weights, dtype=torch.float32)
 
 
 def build_metrics_fn(id2label: dict[int, str]):
@@ -122,41 +111,6 @@ def build_metrics_fn(id2label: dict[int, str]):
     return _compute_metrics
 
 
-class WeightedStableTrainer(Trainer):
-    """
-    Trainer con:
-    - loss pesata per class imbalance
-    - sanitizzazione numerica dei logits
-    """
-
-    def __init__(self, *args, class_weights: torch.Tensor | None = None, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.class_weights = class_weights
-
-    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
-        labels = inputs.pop("labels")
-        outputs = model(**inputs)
-        logits = outputs.get("logits")
-
-        logits = torch.nan_to_num(logits, nan=0.0, posinf=1e4, neginf=-1e4)
-
-        if self.class_weights is not None:
-            weight = self.class_weights.to(device=logits.device, dtype=logits.dtype)
-            loss_fct = nn.CrossEntropyLoss(weight=weight)
-        else:
-            loss_fct = nn.CrossEntropyLoss()
-
-        loss = loss_fct(logits.view(-1, logits.size(-1)), labels.view(-1))
-
-        if not torch.isfinite(loss):
-            loss = torch.zeros((), device=logits.device, dtype=logits.dtype, requires_grad=True)
-
-        if return_outputs:
-            outputs["logits"] = logits
-            return loss, outputs
-        return loss
-
-
 def save_metrics_to_json(metrics: dict, output_path: str) -> None:
     serializable_metrics = {}
     for k, v in metrics.items():
@@ -169,6 +123,84 @@ def save_metrics_to_json(metrics: dict, output_path: str) -> None:
         json.dump(serializable_metrics, f, indent=2)
 
 
+def build_sample_weights(labels: list[int], num_classes: int) -> torch.DoubleTensor:
+    counts = np.bincount(labels, minlength=num_classes).astype(np.float64)
+
+    # Evita divisioni per zero
+    counts = np.where(counts == 0, 1.0, counts)
+
+    class_weights = 1.0 / counts
+    sample_weights = [class_weights[label] for label in labels]
+
+    return torch.DoubleTensor(sample_weights)
+
+
+class BalancedTrainer(Trainer):
+    """
+    Trainer con:
+    - WeightedRandomSampler sul train set
+    - loss stabile numericamente
+    """
+
+    def __init__(
+        self,
+        *args,
+        use_weighted_sampler: bool = True,
+        train_labels: list[int] | None = None,
+        num_classes: int | None = None,
+        **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+        self.use_weighted_sampler = use_weighted_sampler
+        self.train_labels = train_labels
+        self.num_classes = num_classes
+
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        labels = inputs.pop("labels")
+        outputs = model(**inputs)
+        logits = outputs.get("logits")
+
+        logits = torch.nan_to_num(logits, nan=0.0, posinf=1e4, neginf=-1e4)
+
+        loss_fct = nn.CrossEntropyLoss()
+        loss = loss_fct(logits.view(-1, logits.size(-1)), labels.view(-1))
+
+        if not torch.isfinite(loss):
+            loss = torch.zeros((), device=logits.device, dtype=logits.dtype, requires_grad=True)
+
+        if return_outputs:
+            outputs["logits"] = logits
+            return loss, outputs
+        return loss
+
+    def get_train_dataloader(self) -> DataLoader:
+        if self.train_dataset is None:
+            raise ValueError("Trainer: training requires a train_dataset.")
+
+        if not self.use_weighted_sampler:
+            return super().get_train_dataloader()
+
+        if self.train_labels is None or self.num_classes is None:
+            raise ValueError("Weighted sampler requested but train_labels/num_classes are missing.")
+
+        sample_weights = build_sample_weights(self.train_labels, self.num_classes)
+
+        sampler = WeightedRandomSampler(
+            weights=sample_weights,
+            num_samples=len(sample_weights),
+            replacement=True,
+        )
+
+        return DataLoader(
+            self.train_dataset,
+            batch_size=self.args.train_batch_size,
+            sampler=sampler,
+            collate_fn=self.data_collator,
+            num_workers=self.args.dataloader_num_workers,
+            pin_memory=self.args.dataloader_pin_memory,
+        )
+
+
 def train_model(config: Any, model, tokenized_dataset):
     model_name = _get_attr(config, "model.name", "microsoft/deberta-v3-base")
     output_dir = _get_attr(config, "training.output_dir", "outputs")
@@ -179,11 +211,11 @@ def train_model(config: Any, model, tokenized_dataset):
     num_train_epochs = _to_int(_get_attr(config, "training.num_train_epochs", 3), 3)
     fp16 = _to_bool(_get_attr(config, "training.fp16", False), False)
     weight_decay = _to_float(_get_attr(config, "training.weight_decay", 0.01), 0.01)
-    warmup_ratio = _to_float(_get_attr(config, "training.warmup_ratio", 0.1), 0.1)
+    warmup_steps = _to_int(_get_attr(config, "training.warmup_steps", 200), 200)
     gradient_accumulation_steps = _to_int(
         _get_attr(config, "training.gradient_accumulation_steps", 1), 1
     )
-    use_class_weights = _to_bool(_get_attr(config, "training.use_class_weights", True), True)
+    use_weighted_sampler = _to_bool(_get_attr(config, "training.use_weighted_sampler", True), True)
 
     os.makedirs(output_dir, exist_ok=True)
 
@@ -208,14 +240,13 @@ def train_model(config: Any, model, tokenized_dataset):
 
     id2label = model.config.id2label
 
-    class_weights = None
-    if use_class_weights:
-        class_weights = compute_class_weights_from_labels(train_labels, num_classes=num_classes)
-        print("\n[INFO] Class weights enabled:")
-        print(class_weights)
-
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     data_collator = DataCollatorWithPadding(tokenizer=tokenizer)
+
+    if use_weighted_sampler:
+        counts = np.bincount(train_labels, minlength=num_classes)
+        print("\n[INFO] WeightedRandomSampler enabled:")
+        print(f"class_counts = {counts.tolist()}")
 
     print("\n[INFO] Training configuration:")
     print(f"model_name = {model_name}")
@@ -226,9 +257,9 @@ def train_model(config: Any, model, tokenized_dataset):
     print(f"num_train_epochs = {num_train_epochs} ({type(num_train_epochs).__name__})")
     print(f"fp16 = {fp16} ({type(fp16).__name__})")
     print(f"weight_decay = {weight_decay}")
-    print(f"warmup_ratio = {warmup_ratio}")
+    print(f"warmup_steps = {warmup_steps}")
     print(f"gradient_accumulation_steps = {gradient_accumulation_steps}")
-    print(f"use_class_weights = {use_class_weights}")
+    print(f"use_weighted_sampler = {use_weighted_sampler}")
 
     training_args = TrainingArguments(
         output_dir=output_dir,
@@ -245,7 +276,7 @@ def train_model(config: Any, model, tokenized_dataset):
         num_train_epochs=num_train_epochs,
         fp16=fp16,
         max_grad_norm=1.0,
-        warmup_ratio=warmup_ratio,
+        warmup_steps=warmup_steps,
         weight_decay=weight_decay,
         dataloader_num_workers=0,
         dataloader_pin_memory=False,
@@ -254,7 +285,7 @@ def train_model(config: Any, model, tokenized_dataset):
         load_best_model_at_end=True if eval_dataset is not None else False,
     )
 
-    trainer = WeightedStableTrainer(
+    trainer = BalancedTrainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset,
@@ -262,7 +293,9 @@ def train_model(config: Any, model, tokenized_dataset):
         processing_class=tokenizer,
         data_collator=data_collator,
         compute_metrics=build_metrics_fn(id2label) if eval_dataset is not None else None,
-        class_weights=class_weights,
+        use_weighted_sampler=use_weighted_sampler,
+        train_labels=train_labels,
+        num_classes=num_classes,
     )
 
     trainer.train()
