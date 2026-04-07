@@ -41,58 +41,26 @@ def set_seed(seed: int = 42) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
-def extract_3class_label(prediction_text: str) -> str | None:
-    """
-    Map raw GPT verdict text to 3 final classes:
-    - Clear Reply
-    - Ambivalent
-    - Clear Non-Reply
-    """
-    if prediction_text is None:
-        return None
-
-    text = str(prediction_text).lower()
-
-    if "verdict: 1.1" in text or "explicit" in text:
-        return "Clear Reply"
-
-    if "verdict: 1.2" in text or "implicit" in text:
-        return "Clear Reply"
-
-    if "verdict: 2.3" in text or "partial/half-answer" in text or "partial answer" in text:
-        return "Ambivalent"
-
-    if "verdict: 2.1" in text or "dodging" in text:
-        return "Clear Non-Reply"
-
-    if "verdict: 2.4" in text or "general" in text:
-        return "Clear Non-Reply"
-
-    if "non-reply" in text:
-        return "Clear Non-Reply"
-
-    return None
-
-
-def build_text(example: dict[str, Any]) -> str:
-    question = str(example.get("interview_question", "")).strip()
-    answer = str(example.get("interview_answer", "")).strip()
-    return f"Question: {question}\nAnswer: {answer}"
-
-
 def convert_split(raw_split) -> Dataset:
     texts = []
     labels = []
 
     for ex in raw_split:
-        label = extract_3class_label(ex.get("gpt3.5_prediction"))
-        text = build_text(ex)
+        question = str(ex.get("interview_question", "")).strip()
+        answer = str(ex.get("interview_answer", "")).strip()
+        label = ex.get("clarity_label")
 
         if label is None:
             continue
 
-        if not text.strip():
+        label = str(label).strip()
+        if label == "":
             continue
+
+        if not question or not answer:
+            continue
+
+        text = f"Question: {question}\nAnswer: {answer}"
 
         texts.append(text)
         labels.append(label)
@@ -111,6 +79,7 @@ def tokenize_split(split_dataset: Dataset, tokenizer, label2id: dict[str, int], 
 
     for text, label in zip(split_dataset["text"], split_dataset["label"]):
         text = str(text) if text is not None else ""
+        label = str(label).strip() if label is not None else ""
 
         if not text.strip():
             continue
@@ -120,6 +89,9 @@ def tokenize_split(split_dataset: Dataset, tokenizer, label2id: dict[str, int], 
 
         texts.append(text)
         labels.append(label2id[label])
+
+    if len(texts) == 0:
+        raise ValueError("This split became empty before tokenization.")
 
     encoded = tokenizer(
         texts,

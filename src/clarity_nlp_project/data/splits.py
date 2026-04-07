@@ -12,16 +12,7 @@ def make_train_val_test_splits(
     seed: int = 42,
 ) -> DatasetDict:
     """
-    Split the original train set into train + validation, keeping the original test set untouched.
-
-    Args:
-        dataset_dict: Hugging Face DatasetDict with at least 'train' and 'test'
-        label_column: name of the label column in the raw dataset
-        val_size: fraction of original train to use as validation
-        seed: random seed
-
-    Returns:
-        DatasetDict with 'train', 'validation', 'test'
+    Split original train into train + validation, keep original test untouched.
     """
     if "train" not in dataset_dict:
         raise ValueError("dataset_dict must contain a 'train' split.")
@@ -36,6 +27,11 @@ def make_train_val_test_splits(
             f"Label column '{label_column}' does not exist. "
             f"Available columns: {train_full.column_names}"
         )
+
+    if len(train_full) == 0:
+        raise ValueError("Train split is empty.")
+    if len(test_set) == 0:
+        raise ValueError("Test split is empty after cleaning.")
 
     labels = np.array(train_full[label_column])
     indices = np.arange(len(train_full))

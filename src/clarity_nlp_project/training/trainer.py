@@ -108,6 +108,7 @@ def train_model(config: Any, model, tokenized_dataset):
         logging_strategy="epoch",
         report_to="none",
         fp16=fp16,
+        max_grad_norm=1.0,
     )
 
     trainer = Trainer(
