@@ -4,6 +4,8 @@ import os
 from typing import Any
 
 import numpy as np
+import torch
+import torch.nn as nn
 from transformers import (
     AutoTokenizer,
     DataCollatorWithPadding,
@@ -57,15 +59,46 @@ def _compute_metrics(eval_pred):
     return {"accuracy": accuracy}
 
 
+class StableTrainer(Trainer):
+    """
+    Trainer più robusto numericamente.
+    Se i logits contengono NaN/Inf, li sanitizza prima di calcolare la loss.
+    """
+
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        labels = inputs.pop("labels")
+        outputs = model(**inputs)
+        logits = outputs.get("logits")
+
+        # Stabilizzazione numerica
+        logits = torch.nan_to_num(logits, nan=0.0, posinf=1e4, neginf=-1e4)
+
+        loss_fct = nn.CrossEntropyLoss()
+        loss = loss_fct(logits.view(-1, logits.size(-1)), labels.view(-1))
+
+        if not torch.isfinite(loss):
+            loss = torch.zeros((), device=logits.device, requires_grad=True)
+
+        if return_outputs:
+            outputs["logits"] = logits
+            return loss, outputs
+        return loss
+
+
 def train_model(config: Any, model, tokenized_dataset):
     model_name = _get_attr(config, "model.name", "microsoft/deberta-v3-base")
     output_dir = _get_attr(config, "training.output_dir", "outputs")
 
-    learning_rate = _to_float(_get_attr(config, "training.learning_rate", 2e-5), 2e-5)
-    train_batch_size = _to_int(_get_attr(config, "training.per_device_train_batch_size", 8), 8)
-    eval_batch_size = _to_int(_get_attr(config, "training.per_device_eval_batch_size", 8), 8)
+    learning_rate = _to_float(_get_attr(config, "training.learning_rate", 1e-5), 1e-5)
+    train_batch_size = _to_int(_get_attr(config, "training.per_device_train_batch_size", 4), 4)
+    eval_batch_size = _to_int(_get_attr(config, "training.per_device_eval_batch_size", 4), 4)
     num_train_epochs = _to_int(_get_attr(config, "training.num_train_epochs", 3), 3)
     fp16 = _to_bool(_get_attr(config, "training.fp16", False), False)
+    weight_decay = _to_float(_get_attr(config, "training.weight_decay", 0.01), 0.01)
+    warmup_ratio = _to_float(_get_attr(config, "training.warmup_ratio", 0.1), 0.1)
+    gradient_accumulation_steps = _to_int(
+        _get_attr(config, "training.gradient_accumulation_steps", 1), 1
+    )
 
     os.makedirs(output_dir, exist_ok=True)
 
@@ -95,23 +128,32 @@ def train_model(config: Any, model, tokenized_dataset):
     print(f"eval_batch_size = {eval_batch_size} ({type(eval_batch_size).__name__})")
     print(f"num_train_epochs = {num_train_epochs} ({type(num_train_epochs).__name__})")
     print(f"fp16 = {fp16} ({type(fp16).__name__})")
+    print(f"weight_decay = {weight_decay}")
+    print(f"warmup_ratio = {warmup_ratio}")
+    print(f"gradient_accumulation_steps = {gradient_accumulation_steps}")
 
     training_args = TrainingArguments(
         output_dir=output_dir,
         do_train=True,
         do_eval=eval_dataset is not None,
         eval_strategy=eval_strategy,
+        save_strategy="epoch" if eval_dataset is not None else "no",
+        logging_strategy="epoch",
+        report_to="none",
         learning_rate=learning_rate,
         per_device_train_batch_size=train_batch_size,
         per_device_eval_batch_size=eval_batch_size,
+        gradient_accumulation_steps=gradient_accumulation_steps,
         num_train_epochs=num_train_epochs,
-        logging_strategy="epoch",
-        report_to="none",
         fp16=fp16,
         max_grad_norm=1.0,
+        warmup_ratio=warmup_ratio,
+        weight_decay=weight_decay,
+        dataloader_num_workers=0,
+        dataloader_pin_memory=False,
     )
 
-    trainer = Trainer(
+    trainer = StableTrainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset,
