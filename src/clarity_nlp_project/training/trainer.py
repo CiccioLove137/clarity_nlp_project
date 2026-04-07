@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import math
 import os
 from typing import Any
 
@@ -125,8 +124,6 @@ def save_metrics_to_json(metrics: dict, output_path: str) -> None:
 
 def build_sample_weights(labels: list[int], num_classes: int) -> torch.DoubleTensor:
     counts = np.bincount(labels, minlength=num_classes).astype(np.float64)
-
-    # Evita divisioni per zero
     counts = np.where(counts == 0, 1.0, counts)
 
     class_weights = 1.0 / counts
@@ -202,13 +199,13 @@ class BalancedTrainer(Trainer):
 
 
 def train_model(config: Any, model, tokenized_dataset):
-    model_name = _get_attr(config, "model.name", "microsoft/deberta-v3-base")
+    model_name = _get_attr(config, "model.name", "roberta-base")
     output_dir = _get_attr(config, "training.output_dir", "outputs")
 
     learning_rate = _to_float(_get_attr(config, "training.learning_rate", 1e-5), 1e-5)
     train_batch_size = _to_int(_get_attr(config, "training.per_device_train_batch_size", 4), 4)
     eval_batch_size = _to_int(_get_attr(config, "training.per_device_eval_batch_size", 4), 4)
-    num_train_epochs = _to_int(_get_attr(config, "training.num_train_epochs", 3), 3)
+    num_train_epochs = _to_int(_get_attr(config, "training.num_train_epochs", 4), 4)
     fp16 = _to_bool(_get_attr(config, "training.fp16", False), False)
     weight_decay = _to_float(_get_attr(config, "training.weight_decay", 0.01), 0.01)
     warmup_steps = _to_int(_get_attr(config, "training.warmup_steps", 200), 200)
@@ -216,6 +213,9 @@ def train_model(config: Any, model, tokenized_dataset):
         _get_attr(config, "training.gradient_accumulation_steps", 1), 1
     )
     use_weighted_sampler = _to_bool(_get_attr(config, "training.use_weighted_sampler", True), True)
+    load_best_model_at_end = _to_bool(
+        _get_attr(config, "training.load_best_model_at_end", False), False
+    )
 
     os.makedirs(output_dir, exist_ok=True)
 
@@ -260,6 +260,7 @@ def train_model(config: Any, model, tokenized_dataset):
     print(f"warmup_steps = {warmup_steps}")
     print(f"gradient_accumulation_steps = {gradient_accumulation_steps}")
     print(f"use_weighted_sampler = {use_weighted_sampler}")
+    print(f"load_best_model_at_end = {load_best_model_at_end}")
 
     training_args = TrainingArguments(
         output_dir=output_dir,
@@ -280,9 +281,9 @@ def train_model(config: Any, model, tokenized_dataset):
         weight_decay=weight_decay,
         dataloader_num_workers=0,
         dataloader_pin_memory=False,
-        metric_for_best_model="f1_macro" if eval_dataset is not None else None,
+        metric_for_best_model="f1_macro" if (eval_dataset is not None and load_best_model_at_end) else None,
         greater_is_better=True,
-        load_best_model_at_end=True if eval_dataset is not None else False,
+        load_best_model_at_end=load_best_model_at_end if eval_dataset is not None else False,
     )
 
     trainer = BalancedTrainer(

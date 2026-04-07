@@ -5,7 +5,7 @@ dataset:
   val_size: 0.1
 
 model:
-  name: microsoft/deberta-v3-base
+  name: roberta-base
 
 training:
   seed: 42
@@ -19,3 +19,4 @@ training:
   weight_decay: 0.01
   warmup_steps: 200
   use_weighted_sampler: true
+  load_best_model_at_end: false
