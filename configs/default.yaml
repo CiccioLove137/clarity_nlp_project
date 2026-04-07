@@ -18,3 +18,4 @@ training:
   fp16: false
   weight_decay: 0.01
   warmup_ratio: 0.1
+  use_class_weights: true

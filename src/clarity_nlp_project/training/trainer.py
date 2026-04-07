@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import json
 import os
 from typing import Any
 
 import numpy as np
 import torch
 import torch.nn as nn
+from sklearn.metrics import accuracy_score, precision_recall_fscore_support
 from transformers import (
     AutoTokenizer,
     DataCollatorWithPadding,
@@ -52,28 +54,94 @@ def _to_bool(value: Any, default: bool = False) -> bool:
     return default
 
 
-def _compute_metrics(eval_pred):
-    logits, labels = eval_pred
-    preds = np.argmax(logits, axis=-1)
-    accuracy = float((preds == labels).mean())
-    return {"accuracy": accuracy}
+def compute_class_weights_from_labels(labels: list[int], num_classes: int) -> torch.Tensor:
+    counts = np.bincount(labels, minlength=num_classes).astype(np.float32)
+
+    if np.any(counts == 0):
+        counts = np.where(counts == 0, 1.0, counts)
+
+    total = counts.sum()
+    weights = total / (num_classes * counts)
+
+    weights = weights / weights.mean()
+
+    return torch.tensor(weights, dtype=torch.float32)
 
 
-class StableTrainer(Trainer):
+def build_metrics_fn(id2label: dict[int, str]):
+    def _compute_metrics(eval_pred):
+        logits, labels = eval_pred
+        preds = np.argmax(logits, axis=-1)
+
+        accuracy = accuracy_score(labels, preds)
+
+        precision_macro, recall_macro, f1_macro, _ = precision_recall_fscore_support(
+            labels,
+            preds,
+            average="macro",
+            zero_division=0,
+        )
+
+        precision_weighted, recall_weighted, f1_weighted, _ = precision_recall_fscore_support(
+            labels,
+            preds,
+            average="weighted",
+            zero_division=0,
+        )
+
+        precision_per_class, recall_per_class, f1_per_class, support_per_class = precision_recall_fscore_support(
+            labels,
+            preds,
+            average=None,
+            labels=list(sorted(id2label.keys())),
+            zero_division=0,
+        )
+
+        metrics = {
+            "accuracy": float(accuracy),
+            "precision_macro": float(precision_macro),
+            "recall_macro": float(recall_macro),
+            "f1_macro": float(f1_macro),
+            "precision_weighted": float(precision_weighted),
+            "recall_weighted": float(recall_weighted),
+            "f1_weighted": float(f1_weighted),
+        }
+
+        for class_id, class_name in id2label.items():
+            metrics[f"precision_{class_name}"] = float(precision_per_class[class_id])
+            metrics[f"recall_{class_name}"] = float(recall_per_class[class_id])
+            metrics[f"f1_{class_name}"] = float(f1_per_class[class_id])
+            metrics[f"support_{class_name}"] = float(support_per_class[class_id])
+
+        return metrics
+
+    return _compute_metrics
+
+
+class WeightedStableTrainer(Trainer):
     """
-    Trainer più robusto numericamente.
-    Se i logits contengono NaN/Inf, li sanitizza prima di calcolare la loss.
+    Trainer con:
+    - loss pesata per class imbalance
+    - sanitizzazione numerica dei logits
     """
+
+    def __init__(self, *args, class_weights: torch.Tensor | None = None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.class_weights = class_weights
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         labels = inputs.pop("labels")
         outputs = model(**inputs)
         logits = outputs.get("logits")
 
-        # Stabilizzazione numerica
         logits = torch.nan_to_num(logits, nan=0.0, posinf=1e4, neginf=-1e4)
 
-        loss_fct = nn.CrossEntropyLoss()
+        if self.class_weights is not None:
+            weight = self.class_weights.to(logits.device)
+            loss_fct = nn.CrossEntropyLoss(weight=weight)
+        else:
+            loss_fct = nn.CrossEntropyLoss()
+
         loss = loss_fct(logits.view(-1, logits.size(-1)), labels.view(-1))
 
         if not torch.isfinite(loss):
@@ -83,6 +151,18 @@ class StableTrainer(Trainer):
             outputs["logits"] = logits
             return loss, outputs
         return loss
+
+
+def save_metrics_to_json(metrics: dict, output_path: str) -> None:
+    serializable_metrics = {}
+    for k, v in metrics.items():
+        if isinstance(v, (np.floating, np.integer)):
+            serializable_metrics[k] = float(v)
+        else:
+            serializable_metrics[k] = v
+
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(serializable_metrics, f, indent=2)
 
 
 def train_model(config: Any, model, tokenized_dataset):
@@ -99,6 +179,7 @@ def train_model(config: Any, model, tokenized_dataset):
     gradient_accumulation_steps = _to_int(
         _get_attr(config, "training.gradient_accumulation_steps", 1), 1
     )
+    use_class_weights = _to_bool(_get_attr(config, "training.use_class_weights", True), True)
 
     os.makedirs(output_dir, exist_ok=True)
 
@@ -117,6 +198,18 @@ def train_model(config: Any, model, tokenized_dataset):
         eval_dataset = None
         eval_strategy = "no"
 
+    train_labels = list(train_dataset["labels"])
+    unique_class_ids = sorted(set(train_labels))
+    num_classes = len(unique_class_ids)
+
+    id2label = model.config.id2label
+
+    class_weights = None
+    if use_class_weights:
+        class_weights = compute_class_weights_from_labels(train_labels, num_classes=num_classes)
+        print("\n[INFO] Class weights enabled:")
+        print(class_weights)
+
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     data_collator = DataCollatorWithPadding(tokenizer=tokenizer)
 
@@ -131,6 +224,7 @@ def train_model(config: Any, model, tokenized_dataset):
     print(f"weight_decay = {weight_decay}")
     print(f"warmup_ratio = {warmup_ratio}")
     print(f"gradient_accumulation_steps = {gradient_accumulation_steps}")
+    print(f"use_class_weights = {use_class_weights}")
 
     training_args = TrainingArguments(
         output_dir=output_dir,
@@ -151,25 +245,32 @@ def train_model(config: Any, model, tokenized_dataset):
         weight_decay=weight_decay,
         dataloader_num_workers=0,
         dataloader_pin_memory=False,
+        metric_for_best_model="f1_macro" if eval_dataset is not None else None,
+        greater_is_better=True,
+        load_best_model_at_end=True if eval_dataset is not None else False,
     )
 
-    trainer = StableTrainer(
+    trainer = WeightedStableTrainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
         processing_class=tokenizer,
         data_collator=data_collator,
-        compute_metrics=_compute_metrics if eval_dataset is not None else None,
+        compute_metrics=build_metrics_fn(id2label) if eval_dataset is not None else None,
+        class_weights=class_weights,
     )
 
     trainer.train()
 
+    final_metrics = {}
     if eval_dataset is not None:
-        metrics = trainer.evaluate()
+        final_metrics = trainer.evaluate()
         print("\n[INFO] Evaluation metrics:")
-        for k, v in metrics.items():
+        for k, v in final_metrics.items():
             print(f"{k}: {v}")
+
+        save_metrics_to_json(final_metrics, os.path.join(output_dir, "validation_metrics.json"))
 
     trainer.save_model(output_dir)
     tokenizer.save_pretrained(output_dir)
