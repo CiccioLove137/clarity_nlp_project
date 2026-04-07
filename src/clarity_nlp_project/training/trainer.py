@@ -62,13 +62,14 @@ def compute_class_weights_from_labels(labels: list[int], num_classes: int) -> to
 
     total = counts.sum()
     weights = total / (num_classes * counts)
-
     weights = weights / weights.mean()
 
     return torch.tensor(weights, dtype=torch.float32)
 
 
 def build_metrics_fn(id2label: dict[int, str]):
+    ordered_ids = sorted(id2label.keys())
+
     def _compute_metrics(eval_pred):
         logits, labels = eval_pred
         preds = np.argmax(logits, axis=-1)
@@ -93,7 +94,7 @@ def build_metrics_fn(id2label: dict[int, str]):
             labels,
             preds,
             average=None,
-            labels=list(sorted(id2label.keys())),
+            labels=ordered_ids,
             zero_division=0,
         )
 
@@ -107,11 +108,14 @@ def build_metrics_fn(id2label: dict[int, str]):
             "f1_weighted": float(f1_weighted),
         }
 
-        for class_id, class_name in id2label.items():
-            metrics[f"precision_{class_name}"] = float(precision_per_class[class_id])
-            metrics[f"recall_{class_name}"] = float(recall_per_class[class_id])
-            metrics[f"f1_{class_name}"] = float(f1_per_class[class_id])
-            metrics[f"support_{class_name}"] = float(support_per_class[class_id])
+        for idx, class_id in enumerate(ordered_ids):
+            class_name = id2label[class_id]
+            safe_name = class_name.replace(" ", "_")
+
+            metrics[f"precision_{safe_name}"] = float(precision_per_class[idx])
+            metrics[f"recall_{safe_name}"] = float(recall_per_class[idx])
+            metrics[f"f1_{safe_name}"] = float(f1_per_class[idx])
+            metrics[f"support_{safe_name}"] = float(support_per_class[idx])
 
         return metrics
 
@@ -137,7 +141,7 @@ class WeightedStableTrainer(Trainer):
         logits = torch.nan_to_num(logits, nan=0.0, posinf=1e4, neginf=-1e4)
 
         if self.class_weights is not None:
-            weight = self.class_weights.to(logits.device)
+            weight = self.class_weights.to(device=logits.device, dtype=logits.dtype)
             loss_fct = nn.CrossEntropyLoss(weight=weight)
         else:
             loss_fct = nn.CrossEntropyLoss()
@@ -145,7 +149,7 @@ class WeightedStableTrainer(Trainer):
         loss = loss_fct(logits.view(-1, logits.size(-1)), labels.view(-1))
 
         if not torch.isfinite(loss):
-            loss = torch.zeros((), device=logits.device, requires_grad=True)
+            loss = torch.zeros((), device=logits.device, dtype=logits.dtype, requires_grad=True)
 
         if return_outputs:
             outputs["logits"] = logits
