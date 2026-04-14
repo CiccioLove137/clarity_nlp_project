@@ -42,7 +42,8 @@ def set_seed(seed: int = 42) -> None:
 
 
 def convert_split(raw_split) -> Dataset:
-    texts = []
+    questions = []
+    answers = []
     labels = []
 
     for ex in raw_split:
@@ -60,49 +61,67 @@ def convert_split(raw_split) -> Dataset:
         if not question or not answer:
             continue
 
-        text = f"Question: {question}\nAnswer: {answer}"
-
-        texts.append(text)
+        questions.append(question)
+        answers.append(answer)
         labels.append(label)
 
     return Dataset.from_dict(
         {
-            "text": texts,
+            "question": questions,
+            "answer": answers,
             "label": labels,
         }
     )
 
 
 def tokenize_split(split_dataset: Dataset, tokenizer, label2id: dict[str, int], max_length: int) -> Dataset:
-    texts = []
+    questions = []
+    answers = []
     labels = []
 
-    for text, label in zip(split_dataset["text"], split_dataset["label"]):
-        text = str(text) if text is not None else ""
+    for question, answer, label in zip(
+        split_dataset["question"],
+        split_dataset["answer"],
+        split_dataset["label"],
+    ):
+        question = str(question) if question is not None else ""
+        answer = str(answer) if answer is not None else ""
         label = str(label).strip() if label is not None else ""
 
-        if not text.strip():
+        if not question.strip() or not answer.strip():
             continue
 
         if label not in label2id:
             continue
 
-        texts.append(text)
+        questions.append(question)
+        answers.append(answer)
         labels.append(label2id[label])
 
-    if len(texts) == 0:
+    if len(questions) == 0:
         raise ValueError("This split became empty before tokenization.")
 
+    # Tokenizzazione in modalità sequence pair: question + answer
     encoded = tokenizer(
-        texts,
-        truncation=True,
+        questions,
+        answers,
+        truncation="longest_first",
         padding=False,
         max_length=max_length,
     )
 
+    # Longformer: mettiamo attenzione globale sul primo token (<s>)
+    global_attention_mask = []
+    for input_ids in encoded["input_ids"]:
+        gam = [0] * len(input_ids)
+        if len(gam) > 0:
+            gam[0] = 1
+        global_attention_mask.append(gam)
+
     data = {
         "input_ids": encoded["input_ids"],
         "attention_mask": encoded["attention_mask"],
+        "global_attention_mask": global_attention_mask,
         "labels": labels,
     }
 
@@ -129,8 +148,8 @@ def main() -> None:
 
     dataset_name = get_cfg(config, "dataset.name", "ailsntua/QEvasion")
     dataset_config_name = get_cfg(config, "dataset.config_name", None)
-    model_name = get_cfg(config, "model.name", "microsoft/deberta-v3-base")
-    max_length = int(get_cfg(config, "dataset.max_length", 256))
+    model_name = get_cfg(config, "model.name", "allenai/longformer-base-4096")
+    max_length = int(get_cfg(config, "dataset.max_length", 4096))
     val_size = float(get_cfg(config, "dataset.val_size", 0.1))
 
     print("\n[INFO] Loading raw dataset...")
@@ -142,7 +161,7 @@ def main() -> None:
     print("\n[INFO] Raw dataset:")
     print(raw_dataset)
 
-    print("\n[INFO] Converting raw dataset into clean text/label format...")
+    print("\n[INFO] Converting raw dataset into clean question/answer/label format...")
     clean_dataset = DatasetDict(
         {
             "train": convert_split(raw_dataset["train"]),
@@ -165,13 +184,21 @@ def main() -> None:
     print_split_info(dataset, "validation", "label")
     print_split_info(dataset, "test", "label")
 
-    print("\n[INFO] Checking empty texts...")
-    empty_train = sum(1 for x in dataset["train"]["text"] if not str(x).strip())
-    empty_val = sum(1 for x in dataset["validation"]["text"] if not str(x).strip())
-    empty_test = sum(1 for x in dataset["test"]["text"] if not str(x).strip())
-    print(f"empty_train: {empty_train}")
-    print(f"empty_validation: {empty_val}")
-    print(f"empty_test: {empty_test}")
+    print("\n[INFO] Checking empty fields...")
+    empty_train_q = sum(1 for x in dataset["train"]["question"] if not str(x).strip())
+    empty_val_q = sum(1 for x in dataset["validation"]["question"] if not str(x).strip())
+    empty_test_q = sum(1 for x in dataset["test"]["question"] if not str(x).strip())
+
+    empty_train_a = sum(1 for x in dataset["train"]["answer"] if not str(x).strip())
+    empty_val_a = sum(1 for x in dataset["validation"]["answer"] if not str(x).strip())
+    empty_test_a = sum(1 for x in dataset["test"]["answer"] if not str(x).strip())
+
+    print(f"empty_train_question: {empty_train_q}")
+    print(f"empty_validation_question: {empty_val_q}")
+    print(f"empty_test_question: {empty_test_q}")
+    print(f"empty_train_answer: {empty_train_a}")
+    print(f"empty_validation_answer: {empty_val_a}")
+    print(f"empty_test_answer: {empty_test_a}")
 
     print("\n[INFO] Building label mappings...")
     unique_labels = sorted(
