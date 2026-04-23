@@ -1,7 +1,4 @@
 def clean_text(text, config):
-    """
-    Applica una pulizia base al testo.
-    """
     if text is None:
         text = ""
 
@@ -17,10 +14,6 @@ def clean_text(text, config):
 
 
 def build_label_mapping(dataset, label_column):
-    """
-    Costruisce i dizionari label2id e id2label a partire
-    dalle label presenti nel train set.
-    """
     labels = sorted(set(dataset["train"][label_column]))
 
     label2id = {label: idx for idx, label in enumerate(labels)}
@@ -34,13 +27,6 @@ def build_label_mapping(dataset, label_column):
 
 
 def preprocess_dataset(dataset, config):
-    """
-    Preprocessa il dataset:
-    - combina question + interview_answer
-    - pulisce il testo
-    - converte la label da stringa a intero
-    - restituisce solo le colonne utili: text e label
-    """
     label_col = config["dataset"]["label_column"]
 
     label2id, id2label = build_label_mapping(dataset, label_col)
@@ -49,14 +35,14 @@ def preprocess_dataset(dataset, config):
         question = example.get("question", "")
         answer = example.get("interview_answer", "")
 
-        combined_text = f"{question} [SEP] {answer}"
+        combined_text = f"Question: {question}\n\nAnswer: {answer}"
         cleaned_text = clean_text(combined_text, config)
 
         encoded_label = label2id[example[label_col]]
 
         return {
             "text": cleaned_text,
-            "label": encoded_label
+            "label": encoded_label,
         }
 
     processed_dataset = dataset.map(preprocess_example)

@@ -17,16 +17,23 @@ def tokenize_dataset(dataset, config):
     max_length = config["tokenizer"]["max_length"]
 
     def tokenize_example(example):
-        return tokenizer(
+        encoded = tokenizer(
             example["text"],
             padding=config["tokenizer"]["padding"],
             truncation=config["tokenizer"]["truncation"],
-            max_length=max_length
+            max_length=max_length,
         )
+
+        global_attention_mask = [0] * len(encoded["input_ids"])
+        if len(global_attention_mask) > 0:
+            global_attention_mask[0] = 1
+
+        encoded["global_attention_mask"] = global_attention_mask
+        return encoded
 
     print("\n[INFO] Tokenizing dataset...")
 
-    tokenized_dataset = dataset.map(tokenize_example, batched=True)
+    tokenized_dataset = dataset.map(tokenize_example)
 
     print("[INFO] Tokenization completed!")
 

@@ -10,8 +10,8 @@ import torch.nn as nn
 from sklearn.metrics import accuracy_score, precision_recall_fscore_support
 from torch.utils.data import DataLoader, WeightedRandomSampler
 from transformers import (
-    AutoTokenizer,
     DataCollatorWithPadding,
+    EarlyStoppingCallback,
     Trainer,
     TrainingArguments,
 )
@@ -97,13 +97,11 @@ def build_metrics_fn(id2label: dict[int, str]):
         }
 
         for idx, class_id in enumerate(ordered_ids):
-            class_name = id2label[class_id]
-            safe_name = class_name.replace(" ", "_")
-
-            metrics[f"precision_{safe_name}"] = float(precision_per_class[idx])
-            metrics[f"recall_{safe_name}"] = float(recall_per_class[idx])
-            metrics[f"f1_{safe_name}"] = float(f1_per_class[idx])
-            metrics[f"support_{safe_name}"] = float(support_per_class[idx])
+            class_name = id2label[class_id].replace(" ", "_")
+            metrics[f"precision_{class_name}"] = float(precision_per_class[idx])
+            metrics[f"recall_{class_name}"] = float(recall_per_class[idx])
+            metrics[f"f1_{class_name}"] = float(f1_per_class[idx])
+            metrics[f"support_{class_name}"] = float(support_per_class[idx])
 
         return metrics
 
@@ -125,48 +123,53 @@ def save_metrics_to_json(metrics: dict, output_path: str) -> None:
 def build_sample_weights(labels: list[int], num_classes: int) -> torch.DoubleTensor:
     counts = np.bincount(labels, minlength=num_classes).astype(np.float64)
     counts = np.where(counts == 0, 1.0, counts)
-
     class_weights = 1.0 / counts
     sample_weights = [class_weights[label] for label in labels]
-
     return torch.DoubleTensor(sample_weights)
 
 
-class BalancedTrainer(Trainer):
-    """
-    Trainer con:
-    - WeightedRandomSampler sul train set
-    - loss stabile numericamente
-    """
+def build_class_weights(labels: list[int], num_classes: int) -> torch.Tensor:
+    counts = np.bincount(labels, minlength=num_classes).astype(np.float32)
+    counts = np.where(counts == 0, 1.0, counts)
 
+    weights = len(labels) / (num_classes * counts)
+    return torch.tensor(weights, dtype=torch.float32)
+
+
+class BalancedTrainer(Trainer):
     def __init__(
         self,
         *args,
         use_weighted_sampler: bool = True,
         train_labels: list[int] | None = None,
         num_classes: int | None = None,
+        class_weights: torch.Tensor | None = None,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
         self.use_weighted_sampler = use_weighted_sampler
         self.train_labels = train_labels
         self.num_classes = num_classes
+        self.class_weights = class_weights
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         labels = inputs.pop("labels")
         outputs = model(**inputs)
-        logits = outputs.get("logits")
+        logits = outputs.logits
 
         logits = torch.nan_to_num(logits, nan=0.0, posinf=1e4, neginf=-1e4)
 
-        loss_fct = nn.CrossEntropyLoss()
+        weight = None
+        if self.class_weights is not None:
+            weight = self.class_weights.to(logits.device)
+
+        loss_fct = nn.CrossEntropyLoss(weight=weight)
         loss = loss_fct(logits.view(-1, logits.size(-1)), labels.view(-1))
 
         if not torch.isfinite(loss):
             loss = torch.zeros((), device=logits.device, dtype=logits.dtype, requires_grad=True)
 
         if return_outputs:
-            outputs["logits"] = logits
             return loss, outputs
         return loss
 
@@ -198,23 +201,25 @@ class BalancedTrainer(Trainer):
         )
 
 
-def train_model(config: Any, model, tokenized_dataset):
-    model_name = _get_attr(config, "model.name", "roberta-base")
+def train_model(config: Any, model, tokenizer, tokenized_dataset):
     output_dir = _get_attr(config, "training.output_dir", "outputs")
 
-    learning_rate = _to_float(_get_attr(config, "training.learning_rate", 1e-5), 1e-5)
-    train_batch_size = _to_int(_get_attr(config, "training.per_device_train_batch_size", 4), 4)
-    eval_batch_size = _to_int(_get_attr(config, "training.per_device_eval_batch_size", 4), 4)
-    num_train_epochs = _to_int(_get_attr(config, "training.num_train_epochs", 4), 4)
+    learning_rate = _to_float(_get_attr(config, "training.learning_rate", 2e-5), 2e-5)
+    train_batch_size = _to_int(_get_attr(config, "training.per_device_train_batch_size", 1), 1)
+    eval_batch_size = _to_int(_get_attr(config, "training.per_device_eval_batch_size", 1), 1)
+    num_train_epochs = _to_int(_get_attr(config, "training.num_train_epochs", 5), 5)
     fp16 = _to_bool(_get_attr(config, "training.fp16", False), False)
     weight_decay = _to_float(_get_attr(config, "training.weight_decay", 0.01), 0.01)
-    warmup_steps = _to_int(_get_attr(config, "training.warmup_steps", 200), 200)
+    warmup_steps = _to_int(_get_attr(config, "training.warmup_steps", 100), 100)
     gradient_accumulation_steps = _to_int(
-        _get_attr(config, "training.gradient_accumulation_steps", 1), 1
+        _get_attr(config, "training.gradient_accumulation_steps", 8), 8
     )
     use_weighted_sampler = _to_bool(_get_attr(config, "training.use_weighted_sampler", True), True)
     load_best_model_at_end = _to_bool(
-        _get_attr(config, "training.load_best_model_at_end", False), False
+        _get_attr(config, "training.load_best_model_at_end", True), True
+    )
+    early_stopping_patience = _to_int(
+        _get_attr(config, "training.early_stopping_patience", 2), 2
     )
 
     os.makedirs(output_dir, exist_ok=True)
@@ -235,12 +240,10 @@ def train_model(config: Any, model, tokenized_dataset):
         eval_strategy = "no"
 
     train_labels = list(train_dataset["labels"])
-    unique_class_ids = sorted(set(train_labels))
-    num_classes = len(unique_class_ids)
-
+    num_classes = model.config.num_labels
     id2label = model.config.id2label
 
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    class_weights = build_class_weights(train_labels, num_classes)
     data_collator = DataCollatorWithPadding(tokenizer=tokenizer)
 
     if use_weighted_sampler:
@@ -249,18 +252,18 @@ def train_model(config: Any, model, tokenized_dataset):
         print(f"class_counts = {counts.tolist()}")
 
     print("\n[INFO] Training configuration:")
-    print(f"model_name = {model_name}")
     print(f"output_dir = {output_dir}")
-    print(f"learning_rate = {learning_rate} ({type(learning_rate).__name__})")
-    print(f"train_batch_size = {train_batch_size} ({type(train_batch_size).__name__})")
-    print(f"eval_batch_size = {eval_batch_size} ({type(eval_batch_size).__name__})")
-    print(f"num_train_epochs = {num_train_epochs} ({type(num_train_epochs).__name__})")
-    print(f"fp16 = {fp16} ({type(fp16).__name__})")
+    print(f"learning_rate = {learning_rate}")
+    print(f"train_batch_size = {train_batch_size}")
+    print(f"eval_batch_size = {eval_batch_size}")
+    print(f"num_train_epochs = {num_train_epochs}")
+    print(f"fp16 = {fp16}")
     print(f"weight_decay = {weight_decay}")
     print(f"warmup_steps = {warmup_steps}")
     print(f"gradient_accumulation_steps = {gradient_accumulation_steps}")
     print(f"use_weighted_sampler = {use_weighted_sampler}")
     print(f"load_best_model_at_end = {load_best_model_at_end}")
+    print(f"class_weights = {class_weights.tolist()}")
 
     training_args = TrainingArguments(
         output_dir=output_dir,
@@ -281,10 +284,15 @@ def train_model(config: Any, model, tokenized_dataset):
         weight_decay=weight_decay,
         dataloader_num_workers=0,
         dataloader_pin_memory=False,
-        metric_for_best_model="f1_macro" if (eval_dataset is not None and load_best_model_at_end) else None,
+        metric_for_best_model="f1_macro" if eval_dataset is not None else None,
         greater_is_better=True,
         load_best_model_at_end=load_best_model_at_end if eval_dataset is not None else False,
+        save_total_limit=2,
     )
+
+    callbacks = []
+    if eval_dataset is not None and load_best_model_at_end:
+        callbacks.append(EarlyStoppingCallback(early_stopping_patience=early_stopping_patience))
 
     trainer = BalancedTrainer(
         model=model,
@@ -297,6 +305,8 @@ def train_model(config: Any, model, tokenized_dataset):
         use_weighted_sampler=use_weighted_sampler,
         train_labels=train_labels,
         num_classes=num_classes,
+        class_weights=class_weights,
+        callbacks=callbacks,
     )
 
     trainer.train()

@@ -74,9 +74,13 @@ def convert_split(raw_split) -> Dataset:
     )
 
 
-def tokenize_split(split_dataset: Dataset, tokenizer, label2id: dict[str, int], max_length: int) -> Dataset:
-    questions = []
-    answers = []
+def tokenize_split(
+    split_dataset: Dataset,
+    tokenizer,
+    label2id: dict[str, int],
+    max_length: int,
+) -> Dataset:
+    texts = []
     labels = []
 
     for question, answer, label in zip(
@@ -84,33 +88,30 @@ def tokenize_split(split_dataset: Dataset, tokenizer, label2id: dict[str, int], 
         split_dataset["answer"],
         split_dataset["label"],
     ):
-        question = str(question) if question is not None else ""
-        answer = str(answer) if answer is not None else ""
+        question = str(question).strip() if question is not None else ""
+        answer = str(answer).strip() if answer is not None else ""
         label = str(label).strip() if label is not None else ""
 
-        if not question.strip() or not answer.strip():
+        if not question or not answer:
             continue
 
         if label not in label2id:
             continue
 
-        questions.append(question)
-        answers.append(answer)
+        combined_text = f"Question: {question}\n\nAnswer: {answer}"
+        texts.append(combined_text)
         labels.append(label2id[label])
 
-    if len(questions) == 0:
+    if len(texts) == 0:
         raise ValueError("This split became empty before tokenization.")
 
-    # Tokenizzazione in modalità sequence pair: question + answer
     encoded = tokenizer(
-        questions,
-        answers,
-        truncation="longest_first",
+        texts,
+        truncation=True,
         padding=False,
         max_length=max_length,
     )
 
-    # Longformer: mettiamo attenzione globale sul primo token (<s>)
     global_attention_mask = []
     for input_ids in encoded["input_ids"]:
         gam = [0] * len(input_ids)
@@ -259,7 +260,7 @@ def main() -> None:
     print("[INFO] Model loaded successfully!")
 
     print("\n[INFO] Starting training...")
-    trainer = train_model(config, model, tokenized_dataset)
+    trainer = train_model(config, model, tokenizer, tokenized_dataset)
 
     print("\n[INFO] Running final evaluation on TEST set...")
     test_metrics = trainer.evaluate(eval_dataset=tokenized_dataset["test"])
