@@ -73,13 +73,13 @@ def convert_split(raw_split) -> Dataset:
         }
     )
 
-
 def tokenize_split(
     split_dataset: Dataset,
     tokenizer,
     label2id: dict[str, int],
     max_length: int,
 ) -> Dataset:
+
     texts = []
     labels = []
 
@@ -98,11 +98,20 @@ def tokenize_split(
         if label not in label2id:
             continue
 
-        combined_text = f"Question: {question}\n\nAnswer: {answer}"
+        combined_text = (
+            "<QUESTION>\n"
+            f"{question}\n\n"
+            "</QUESTION>\n\n"
+            "<ANSWER>\n"
+            f"{answer}\n\n"
+            f"{answer}"  # DUPLICAZIONE RISPOSTA (più peso)
+            "\n</ANSWER>"
+        )
+
         texts.append(combined_text)
         labels.append(label2id[label])
 
-    if len(texts) == 0:
+    if len(texts) == 0: 
         raise ValueError("This split became empty before tokenization.")
 
     encoded = tokenizer(
@@ -112,11 +121,23 @@ def tokenize_split(
         max_length=max_length,
     )
 
+    # GLOBAL ATTENTION INTELLIGENTE
     global_attention_mask = []
+
     for input_ids in encoded["input_ids"]:
         gam = [0] * len(input_ids)
+
+        # sempre il primo token
         if len(gam) > 0:
             gam[0] = 1
+
+        # GLOBAL ATTENTION INTELLIGENTE
+        decoded = tokenizer.convert_ids_to_tokens(input_ids)
+
+        for i, tok in enumerate(decoded):
+            if tok in ["<QUESTION>", "<ANSWER>"]:
+                gam[i] = 1
+
         global_attention_mask.append(gam)
 
     data = {
@@ -130,7 +151,6 @@ def tokenize_split(
         data["token_type_ids"] = encoded["token_type_ids"]
 
     return Dataset.from_dict(data)
-
 
 def analyze_tokenized_split(split_name: str, tokenized_split: Dataset, max_length: int) -> None:
     lengths = [len(input_ids) for input_ids in tokenized_split["input_ids"]]
