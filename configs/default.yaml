@@ -3,6 +3,7 @@ dataset:
   config_name: null
   max_length: 4096
   val_size: 0.1
+  answer_global_tokens: 20
 
 model:
   name: allenai/longformer-base-4096

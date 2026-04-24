@@ -83,10 +83,6 @@ def convert_split(raw_split) -> Dataset:
 
 
 def add_special_tokens_to_tokenizer(tokenizer) -> int:
-    """
-    Aggiunge marker strutturali per distinguere chiaramente domanda e risposta.
-    Restituisce il numero di token aggiunti.
-    """
     special_tokens_dict = {
         "additional_special_tokens": SPECIAL_TOKENS
     }
@@ -106,6 +102,7 @@ def tokenize_split(
     tokenizer,
     label2id: dict[str, int],
     max_length: int,
+    answer_global_tokens: int = 20,
 ) -> Dataset:
     texts = []
     labels = []
@@ -130,7 +127,6 @@ def tokenize_split(
             f"{question}\n"
             "</QUESTION>\n\n"
             "<ANSWER>\n"
-            f"{answer}\n\n"
             f"{answer}\n"
             "</ANSWER>"
         )
@@ -156,12 +152,24 @@ def tokenize_split(
     for input_ids in encoded["input_ids"]:
         gam = [0] * len(input_ids)
 
+        # Token iniziale <s>
         if len(gam) > 0:
             gam[0] = 1
 
         for i, token_id in enumerate(input_ids):
-            if token_id == question_token_id or token_id == answer_token_id:
+            # Marker della domanda
+            if token_id == question_token_id:
                 gam[i] = 1
+
+            # Marker della risposta + primi token della risposta
+            if token_id == answer_token_id:
+                gam[i] = 1
+
+                start = i + 1
+                end = min(i + 1 + answer_global_tokens, len(gam))
+
+                for j in range(start, end):
+                    gam[j] = 1
 
         global_attention_mask.append(gam)
 
@@ -210,7 +218,7 @@ def check_global_attention_mask(split_name: str, tokenized_split: Dataset, n_exa
         print(f"  input_len = {len(input_ids)}")
         print(f"  gam_len = {len(gam)}")
         print(f"  gam_sum = {sum(gam)}")
-        print(f"  first_30_gam = {gam[:30]}")
+        print(f"  first_40_gam = {gam[:40]}")
 
         if len(gam) != len(input_ids):
             print("  [WARNING] global_attention_mask length is different from input_ids length.")
@@ -241,7 +249,6 @@ def inspect_decoded_example(
         f"{dataset_split[example_index]['question']}\n"
         "</QUESTION>\n\n"
         "<ANSWER>\n"
-        f"{dataset_split[example_index]['answer']}\n\n"
         f"{dataset_split[example_index]['answer']}\n"
         "</ANSWER>"
     )
@@ -253,7 +260,7 @@ def inspect_decoded_example(
 
     decoded_without_special_tokens = tokenizer.decode(
         tokenized_split[example_index]["input_ids"],
-        skip_special_tokens=False,
+        skip_special_tokens=True,
     )
 
     print(f"\n[CHECK] Decoded tokenization example - {split_name}")
@@ -267,7 +274,7 @@ def inspect_decoded_example(
     print("\n--- DECODED WITH SPECIAL TOKENS ---")
     print(decoded_with_special_tokens[:max_chars])
 
-    print("\n--- DECODED TEXT ---")
+    print("\n--- DECODED WITHOUT SPECIAL TOKENS ---")
     print(decoded_without_special_tokens[:max_chars])
 
 
@@ -333,6 +340,7 @@ def main() -> None:
     model_name = get_cfg(config, "model.name", "allenai/longformer-base-4096")
     max_length = int(get_cfg(config, "dataset.max_length", 4096))
     val_size = float(get_cfg(config, "dataset.val_size", 0.1))
+    answer_global_tokens = int(get_cfg(config, "dataset.answer_global_tokens", 20))
 
     print("\n[INFO] Loading raw dataset...")
     if dataset_config_name:
@@ -398,14 +406,34 @@ def main() -> None:
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     num_added_tokens = add_special_tokens_to_tokenizer(tokenizer)
 
+    print(f"\n[INFO] answer_global_tokens = {answer_global_tokens}")
+
     print("\n[INFO] Tokenizing train split...")
-    tokenized_train = tokenize_split(dataset["train"], tokenizer, label2id, max_length)
+    tokenized_train = tokenize_split(
+        dataset["train"],
+        tokenizer,
+        label2id,
+        max_length,
+        answer_global_tokens=answer_global_tokens,
+    )
 
     print("\n[INFO] Tokenizing validation split...")
-    tokenized_validation = tokenize_split(dataset["validation"], tokenizer, label2id, max_length)
+    tokenized_validation = tokenize_split(
+        dataset["validation"],
+        tokenizer,
+        label2id,
+        max_length,
+        answer_global_tokens=answer_global_tokens,
+    )
 
     print("\n[INFO] Tokenizing test split...")
-    tokenized_test = tokenize_split(dataset["test"], tokenizer, label2id, max_length)
+    tokenized_test = tokenize_split(
+        dataset["test"],
+        tokenizer,
+        label2id,
+        max_length,
+        answer_global_tokens=answer_global_tokens,
+    )
 
     tokenized_dataset = DatasetDict(
         {
