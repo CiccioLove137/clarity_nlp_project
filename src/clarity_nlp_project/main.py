@@ -132,6 +132,123 @@ def tokenize_split(
     return Dataset.from_dict(data)
 
 
+def analyze_tokenized_split(split_name: str, tokenized_split: Dataset, max_length: int) -> None:
+    lengths = [len(input_ids) for input_ids in tokenized_split["input_ids"]]
+
+    num_examples = len(lengths)
+    min_len = min(lengths)
+    max_len = max(lengths)
+    avg_len = sum(lengths) / num_examples
+    num_at_max_length = sum(1 for length in lengths if length == max_length)
+    pct_at_max_length = 100.0 * num_at_max_length / num_examples
+
+    print(f"\n[CHECK] Token length statistics - {split_name}")
+    print(f"num_examples = {num_examples}")
+    print(f"min_len = {min_len}")
+    print(f"avg_len = {avg_len:.2f}")
+    print(f"max_len = {max_len}")
+    print(f"num_at_max_length = {num_at_max_length}")
+    print(f"pct_at_max_length = {pct_at_max_length:.2f}%")
+
+
+def check_global_attention_mask(split_name: str, tokenized_split: Dataset, n_examples: int = 5) -> None:
+    print(f"\n[CHECK] Global attention mask - {split_name}")
+
+    n_examples = min(n_examples, len(tokenized_split))
+
+    for i in range(n_examples):
+        gam = tokenized_split[i]["global_attention_mask"]
+        input_ids = tokenized_split[i]["input_ids"]
+
+        print(f"example_{i}:")
+        print(f"  input_len = {len(input_ids)}")
+        print(f"  gam_len = {len(gam)}")
+        print(f"  gam_sum = {sum(gam)}")
+        print(f"  first_20_gam = {gam[:20]}")
+
+        if len(gam) != len(input_ids):
+            print("  [WARNING] global_attention_mask length is different from input_ids length.")
+
+        if len(gam) > 0 and gam[0] != 1:
+            print("  [WARNING] first token does not have global attention.")
+
+        if sum(gam) != 1:
+            print("  [WARNING] expected exactly one global attention token.")
+
+
+def inspect_decoded_example(
+    dataset_split: Dataset,
+    tokenized_split: Dataset,
+    tokenizer,
+    split_name: str,
+    example_index: int = 0,
+    max_chars: int = 3000,
+) -> None:
+    if len(tokenized_split) == 0:
+        print(f"\n[CHECK] Cannot decode example from {split_name}: split is empty.")
+        return
+
+    example_index = min(example_index, len(tokenized_split) - 1)
+
+    original_text = (
+        f"Question: {dataset_split[example_index]['question']}\n\n"
+        f"Answer: {dataset_split[example_index]['answer']}"
+    )
+
+    decoded_with_special_tokens = tokenizer.decode(
+        tokenized_split[example_index]["input_ids"],
+        skip_special_tokens=False,
+    )
+
+    decoded_without_special_tokens = tokenizer.decode(
+        tokenized_split[example_index]["input_ids"],
+        skip_special_tokens=True,
+    )
+
+    print(f"\n[CHECK] Decoded tokenization example - {split_name}")
+    print(f"example_index = {example_index}")
+    print(f"label_id = {tokenized_split[example_index]['labels']}")
+    print(f"tokenized_length = {len(tokenized_split[example_index]['input_ids'])}")
+
+    print("\n--- ORIGINAL TEXT ---")
+    print(original_text[:max_chars])
+
+    print("\n--- DECODED WITH SPECIAL TOKENS ---")
+    print(decoded_with_special_tokens[:max_chars])
+
+    print("\n--- DECODED WITHOUT SPECIAL TOKENS ---")
+    print(decoded_without_special_tokens[:max_chars])
+
+
+def run_tokenizer_checks(
+    dataset: DatasetDict,
+    tokenized_dataset: DatasetDict,
+    tokenizer,
+    max_length: int,
+) -> None:
+    print("\n" + "=" * 80)
+    print("[CHECK] TOKENIZER DIAGNOSTICS")
+    print("=" * 80)
+
+    analyze_tokenized_split("train", tokenized_dataset["train"], max_length)
+    analyze_tokenized_split("validation", tokenized_dataset["validation"], max_length)
+    analyze_tokenized_split("test", tokenized_dataset["test"], max_length)
+
+    check_global_attention_mask("train", tokenized_dataset["train"], n_examples=5)
+
+    inspect_decoded_example(
+        dataset_split=dataset["train"],
+        tokenized_split=tokenized_dataset["train"],
+        tokenizer=tokenizer,
+        split_name="train",
+        example_index=0,
+    )
+
+    print("\n" + "=" * 80)
+    print("[CHECK] TOKENIZER DIAGNOSTICS COMPLETED")
+    print("=" * 80)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -246,6 +363,13 @@ def main() -> None:
     print("train:", set(tokenized_dataset["train"]["labels"]))
     print("validation:", set(tokenized_dataset["validation"]["labels"]))
     print("test:", set(tokenized_dataset["test"]["labels"]))
+
+    run_tokenizer_checks(
+        dataset=dataset,
+        tokenized_dataset=tokenized_dataset,
+        tokenizer=tokenizer,
+        max_length=max_length,
+    )
 
     num_labels = len(label2id)
 
