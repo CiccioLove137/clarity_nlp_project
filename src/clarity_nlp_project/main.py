@@ -17,6 +17,14 @@ from src.clarity_nlp_project.data.splits import (
 from src.clarity_nlp_project.training.trainer import train_model
 
 
+SPECIAL_TOKENS = [
+    "<QUESTION>",
+    "</QUESTION>",
+    "<ANSWER>",
+    "</ANSWER>",
+]
+
+
 def load_config(config_path: str) -> dict[str, Any]:
     with open(config_path, "r", encoding="utf-8") as f:
         return yaml.safe_load(f)
@@ -73,13 +81,32 @@ def convert_split(raw_split) -> Dataset:
         }
     )
 
+
+def add_special_tokens_to_tokenizer(tokenizer) -> int:
+    """
+    Aggiunge marker strutturali per distinguere chiaramente domanda e risposta.
+    Restituisce il numero di token aggiunti.
+    """
+    special_tokens_dict = {
+        "additional_special_tokens": SPECIAL_TOKENS
+    }
+
+    num_added_tokens = tokenizer.add_special_tokens(special_tokens_dict)
+
+    print("\n[INFO] Added special tokens to tokenizer:")
+    print(f"special_tokens = {SPECIAL_TOKENS}")
+    print(f"num_added_tokens = {num_added_tokens}")
+    print(f"tokenizer_vocab_size = {len(tokenizer)}")
+
+    return num_added_tokens
+
+
 def tokenize_split(
     split_dataset: Dataset,
     tokenizer,
     label2id: dict[str, int],
     max_length: int,
 ) -> Dataset:
-
     texts = []
     labels = []
 
@@ -100,18 +127,18 @@ def tokenize_split(
 
         combined_text = (
             "<QUESTION>\n"
-            f"{question}\n\n"
+            f"{question}\n"
             "</QUESTION>\n\n"
             "<ANSWER>\n"
             f"{answer}\n\n"
-            f"{answer}"  # DUPLICAZIONE RISPOSTA (più peso)
-            "\n</ANSWER>"
+            f"{answer}\n"
+            "</ANSWER>"
         )
 
         texts.append(combined_text)
         labels.append(label2id[label])
 
-    if len(texts) == 0: 
+    if len(texts) == 0:
         raise ValueError("This split became empty before tokenization.")
 
     encoded = tokenizer(
@@ -121,21 +148,19 @@ def tokenize_split(
         max_length=max_length,
     )
 
-    # GLOBAL ATTENTION INTELLIGENTE
+    question_token_id = tokenizer.convert_tokens_to_ids("<QUESTION>")
+    answer_token_id = tokenizer.convert_tokens_to_ids("<ANSWER>")
+
     global_attention_mask = []
 
     for input_ids in encoded["input_ids"]:
         gam = [0] * len(input_ids)
 
-        # sempre il primo token
         if len(gam) > 0:
             gam[0] = 1
 
-        # GLOBAL ATTENTION INTELLIGENTE
-        decoded = tokenizer.convert_ids_to_tokens(input_ids)
-
-        for i, tok in enumerate(decoded):
-            if tok in ["<QUESTION>", "<ANSWER>"]:
+        for i, token_id in enumerate(input_ids):
+            if token_id == question_token_id or token_id == answer_token_id:
                 gam[i] = 1
 
         global_attention_mask.append(gam)
@@ -151,6 +176,7 @@ def tokenize_split(
         data["token_type_ids"] = encoded["token_type_ids"]
 
     return Dataset.from_dict(data)
+
 
 def analyze_tokenized_split(split_name: str, tokenized_split: Dataset, max_length: int) -> None:
     lengths = [len(input_ids) for input_ids in tokenized_split["input_ids"]]
@@ -184,7 +210,7 @@ def check_global_attention_mask(split_name: str, tokenized_split: Dataset, n_exa
         print(f"  input_len = {len(input_ids)}")
         print(f"  gam_len = {len(gam)}")
         print(f"  gam_sum = {sum(gam)}")
-        print(f"  first_20_gam = {gam[:20]}")
+        print(f"  first_30_gam = {gam[:30]}")
 
         if len(gam) != len(input_ids):
             print("  [WARNING] global_attention_mask length is different from input_ids length.")
@@ -192,8 +218,8 @@ def check_global_attention_mask(split_name: str, tokenized_split: Dataset, n_exa
         if len(gam) > 0 and gam[0] != 1:
             print("  [WARNING] first token does not have global attention.")
 
-        if sum(gam) != 1:
-            print("  [WARNING] expected exactly one global attention token.")
+        if sum(gam) < 1:
+            print("  [WARNING] no global attention tokens found.")
 
 
 def inspect_decoded_example(
@@ -211,8 +237,13 @@ def inspect_decoded_example(
     example_index = min(example_index, len(tokenized_split) - 1)
 
     original_text = (
-        f"Question: {dataset_split[example_index]['question']}\n\n"
-        f"Answer: {dataset_split[example_index]['answer']}"
+        "<QUESTION>\n"
+        f"{dataset_split[example_index]['question']}\n"
+        "</QUESTION>\n\n"
+        "<ANSWER>\n"
+        f"{dataset_split[example_index]['answer']}\n\n"
+        f"{dataset_split[example_index]['answer']}\n"
+        "</ANSWER>"
     )
 
     decoded_with_special_tokens = tokenizer.decode(
@@ -222,7 +253,7 @@ def inspect_decoded_example(
 
     decoded_without_special_tokens = tokenizer.decode(
         tokenized_split[example_index]["input_ids"],
-        skip_special_tokens=True,
+        skip_special_tokens=False,
     )
 
     print(f"\n[CHECK] Decoded tokenization example - {split_name}")
@@ -236,8 +267,19 @@ def inspect_decoded_example(
     print("\n--- DECODED WITH SPECIAL TOKENS ---")
     print(decoded_with_special_tokens[:max_chars])
 
-    print("\n--- DECODED WITHOUT SPECIAL TOKENS ---")
+    print("\n--- DECODED TEXT ---")
     print(decoded_without_special_tokens[:max_chars])
+
+
+def check_special_token_ids(tokenizer) -> None:
+    print("\n[CHECK] Special token IDs")
+
+    for token in SPECIAL_TOKENS:
+        token_id = tokenizer.convert_tokens_to_ids(token)
+        print(f"{token} -> {token_id}")
+
+        if token_id == tokenizer.unk_token_id:
+            print(f"[WARNING] {token} is mapped to unk_token_id.")
 
 
 def run_tokenizer_checks(
@@ -249,6 +291,8 @@ def run_tokenizer_checks(
     print("\n" + "=" * 80)
     print("[CHECK] TOKENIZER DIAGNOSTICS")
     print("=" * 80)
+
+    check_special_token_ids(tokenizer)
 
     analyze_tokenized_split("train", tokenized_dataset["train"], max_length)
     analyze_tokenized_split("validation", tokenized_dataset["validation"], max_length)
@@ -352,6 +396,7 @@ def main() -> None:
 
     print("\n[INFO] Loading tokenizer...")
     tokenizer = AutoTokenizer.from_pretrained(model_name)
+    num_added_tokens = add_special_tokens_to_tokenizer(tokenizer)
 
     print("\n[INFO] Tokenizing train split...")
     tokenized_train = tokenize_split(dataset["train"], tokenizer, label2id, max_length)
@@ -400,6 +445,11 @@ def main() -> None:
         id2label=id2label,
         label2id=label2id,
     )
+
+    if num_added_tokens > 0:
+        print("\n[INFO] Resizing model token embeddings...")
+        model.resize_token_embeddings(len(tokenizer))
+        print(f"[INFO] New embedding size = {len(tokenizer)}")
 
     print("[INFO] Model loaded successfully!")
 
