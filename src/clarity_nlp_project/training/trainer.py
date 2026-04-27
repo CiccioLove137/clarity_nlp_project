@@ -9,12 +9,7 @@ import torch
 import torch.nn as nn
 from sklearn.metrics import accuracy_score, precision_recall_fscore_support
 from torch.utils.data import DataLoader, WeightedRandomSampler
-from transformers import (
-    DataCollatorWithPadding,
-    EarlyStoppingCallback,
-    Trainer,
-    TrainingArguments,
-)
+from transformers import DataCollatorWithPadding, Trainer, TrainingArguments
 
 
 def _get_attr(config: Any, path: str, default: Any = None) -> Any:
@@ -78,12 +73,14 @@ def build_metrics_fn(id2label: dict[int, str]):
             zero_division=0,
         )
 
-        precision_per_class, recall_per_class, f1_per_class, support_per_class = precision_recall_fscore_support(
-            labels,
-            preds,
-            average=None,
-            labels=ordered_ids,
-            zero_division=0,
+        precision_per_class, recall_per_class, f1_per_class, support_per_class = (
+            precision_recall_fscore_support(
+                labels,
+                preds,
+                average=None,
+                labels=ordered_ids,
+                zero_division=0,
+            )
         )
 
         metrics = {
@@ -97,24 +94,27 @@ def build_metrics_fn(id2label: dict[int, str]):
         }
 
         for idx, class_id in enumerate(ordered_ids):
-            class_name = id2label[class_id].replace(" ", "_")
-            metrics[f"precision_{class_name}"] = float(precision_per_class[idx])
-            metrics[f"recall_{class_name}"] = float(recall_per_class[idx])
-            metrics[f"f1_{class_name}"] = float(f1_per_class[idx])
-            metrics[f"support_{class_name}"] = float(support_per_class[idx])
+            class_name = id2label[class_id]
+            safe_name = class_name.replace(" ", "_")
+
+            metrics[f"precision_{safe_name}"] = float(precision_per_class[idx])
+            metrics[f"recall_{safe_name}"] = float(recall_per_class[idx])
+            metrics[f"f1_{safe_name}"] = float(f1_per_class[idx])
+            metrics[f"support_{safe_name}"] = float(support_per_class[idx])
 
         return metrics
 
     return _compute_metrics
 
 
-def save_metrics_to_json(metrics: dict, output_path: str) -> None:
+def save_metrics_to_json(metrics: dict[str, Any], output_path: str) -> None:
     serializable_metrics = {}
-    for k, v in metrics.items():
-        if isinstance(v, (np.floating, np.integer)):
-            serializable_metrics[k] = float(v)
+
+    for key, value in metrics.items():
+        if isinstance(value, (np.floating, np.integer)):
+            serializable_metrics[key] = float(value)
         else:
-            serializable_metrics[k] = v
+            serializable_metrics[key] = value
 
     with open(output_path, "w", encoding="utf-8") as f:
         json.dump(serializable_metrics, f, indent=2)
@@ -123,17 +123,21 @@ def save_metrics_to_json(metrics: dict, output_path: str) -> None:
 def build_sample_weights(labels: list[int], num_classes: int) -> torch.DoubleTensor:
     counts = np.bincount(labels, minlength=num_classes).astype(np.float64)
     counts = np.where(counts == 0, 1.0, counts)
+
     class_weights = 1.0 / counts
     sample_weights = [class_weights[label] for label in labels]
+
     return torch.DoubleTensor(sample_weights)
 
 
-def build_class_weights(labels: list[int], num_classes: int) -> torch.Tensor:
-    counts = np.bincount(labels, minlength=num_classes).astype(np.float32)
+def build_class_weights(labels: list[int], num_classes: int) -> torch.FloatTensor:
+    counts = np.bincount(labels, minlength=num_classes).astype(np.float64)
     counts = np.where(counts == 0, 1.0, counts)
 
-    weights = len(labels) / (num_classes * counts)
-    return torch.tensor(weights, dtype=torch.float32)
+    total = counts.sum()
+    class_weights = total / (num_classes * counts)
+
+    return torch.FloatTensor(class_weights)
 
 
 class BalancedTrainer(Trainer):
@@ -141,36 +145,66 @@ class BalancedTrainer(Trainer):
         self,
         *args,
         use_weighted_sampler: bool = True,
+        use_class_weights: bool = True,
         train_labels: list[int] | None = None,
         num_classes: int | None = None,
-        class_weights: torch.Tensor | None = None,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
+
         self.use_weighted_sampler = use_weighted_sampler
+        self.use_class_weights = use_class_weights
         self.train_labels = train_labels
         self.num_classes = num_classes
-        self.class_weights = class_weights
+
+        self.class_weights = None
+        if self.use_class_weights:
+            if self.train_labels is None or self.num_classes is None:
+                raise ValueError(
+                    "Class weights requested but train_labels/num_classes are missing."
+                )
+
+            self.class_weights = build_class_weights(
+                labels=self.train_labels,
+                num_classes=self.num_classes,
+            )
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         labels = inputs.pop("labels")
+
         outputs = model(**inputs)
-        logits = outputs.logits
+        logits = outputs.get("logits")
 
-        logits = torch.nan_to_num(logits, nan=0.0, posinf=1e4, neginf=-1e4)
+        logits = torch.nan_to_num(
+            logits,
+            nan=0.0,
+            posinf=1e4,
+            neginf=-1e4,
+        )
 
-        weight = None
         if self.class_weights is not None:
-            weight = self.class_weights.to(logits.device)
+            class_weights = self.class_weights.to(logits.device)
+            loss_fct = nn.CrossEntropyLoss(weight=class_weights)
+        else:
+            loss_fct = nn.CrossEntropyLoss()
 
-        loss_fct = nn.CrossEntropyLoss(weight=weight)
-        loss = loss_fct(logits.view(-1, logits.size(-1)), labels.view(-1))
+        loss = loss_fct(
+            logits.view(-1, logits.size(-1)),
+            labels.view(-1),
+        )
 
         if not torch.isfinite(loss):
-            loss = torch.zeros((), device=logits.device, dtype=logits.dtype, requires_grad=True)
+            loss = torch.zeros(
+                (),
+                device=logits.device,
+                dtype=logits.dtype,
+                requires_grad=True,
+            )
 
         if return_outputs:
+            outputs["logits"] = logits
             return loss, outputs
+
         return loss
 
     def get_train_dataloader(self) -> DataLoader:
@@ -181,9 +215,14 @@ class BalancedTrainer(Trainer):
             return super().get_train_dataloader()
 
         if self.train_labels is None or self.num_classes is None:
-            raise ValueError("Weighted sampler requested but train_labels/num_classes are missing.")
+            raise ValueError(
+                "Weighted sampler requested but train_labels/num_classes are missing."
+            )
 
-        sample_weights = build_sample_weights(self.train_labels, self.num_classes)
+        sample_weights = build_sample_weights(
+            labels=self.train_labels,
+            num_classes=self.num_classes,
+        )
 
         sampler = WeightedRandomSampler(
             weights=sample_weights,
@@ -205,21 +244,29 @@ def train_model(config: Any, model, tokenizer, tokenized_dataset):
     output_dir = _get_attr(config, "training.output_dir", "outputs")
 
     learning_rate = _to_float(_get_attr(config, "training.learning_rate", 2e-5), 2e-5)
-    train_batch_size = _to_int(_get_attr(config, "training.per_device_train_batch_size", 1), 1)
-    eval_batch_size = _to_int(_get_attr(config, "training.per_device_eval_batch_size", 1), 1)
-    num_train_epochs = _to_int(_get_attr(config, "training.num_train_epochs", 5), 5)
+    train_batch_size = _to_int(
+        _get_attr(config, "training.per_device_train_batch_size", 1), 1
+    )
+    eval_batch_size = _to_int(
+        _get_attr(config, "training.per_device_eval_batch_size", 1), 1
+    )
+    num_train_epochs = _to_int(
+        _get_attr(config, "training.num_train_epochs", 5), 5
+    )
     fp16 = _to_bool(_get_attr(config, "training.fp16", False), False)
     weight_decay = _to_float(_get_attr(config, "training.weight_decay", 0.01), 0.01)
     warmup_steps = _to_int(_get_attr(config, "training.warmup_steps", 100), 100)
     gradient_accumulation_steps = _to_int(
         _get_attr(config, "training.gradient_accumulation_steps", 8), 8
     )
-    use_weighted_sampler = _to_bool(_get_attr(config, "training.use_weighted_sampler", True), True)
+    use_weighted_sampler = _to_bool(
+        _get_attr(config, "training.use_weighted_sampler", True), True
+    )
+    use_class_weights = _to_bool(
+        _get_attr(config, "training.use_class_weights", True), True
+    )
     load_best_model_at_end = _to_bool(
         _get_attr(config, "training.load_best_model_at_end", True), True
-    )
-    early_stopping_patience = _to_int(
-        _get_attr(config, "training.early_stopping_patience", 2), 2
     )
 
     os.makedirs(output_dir, exist_ok=True)
@@ -240,16 +287,22 @@ def train_model(config: Any, model, tokenizer, tokenized_dataset):
         eval_strategy = "no"
 
     train_labels = list(train_dataset["labels"])
-    num_classes = model.config.num_labels
+    unique_class_ids = sorted(set(train_labels))
+    num_classes = len(unique_class_ids)
+
     id2label = model.config.id2label
 
-    class_weights = build_class_weights(train_labels, num_classes)
     data_collator = DataCollatorWithPadding(tokenizer=tokenizer)
 
     if use_weighted_sampler:
         counts = np.bincount(train_labels, minlength=num_classes)
         print("\n[INFO] WeightedRandomSampler enabled:")
         print(f"class_counts = {counts.tolist()}")
+
+    if use_class_weights:
+        class_weights = build_class_weights(train_labels, num_classes)
+        print("\n[INFO] Class weights enabled:")
+        print(f"class_weights = {class_weights.tolist()}")
 
     print("\n[INFO] Training configuration:")
     print(f"output_dir = {output_dir}")
@@ -262,8 +315,8 @@ def train_model(config: Any, model, tokenizer, tokenized_dataset):
     print(f"warmup_steps = {warmup_steps}")
     print(f"gradient_accumulation_steps = {gradient_accumulation_steps}")
     print(f"use_weighted_sampler = {use_weighted_sampler}")
+    print(f"use_class_weights = {use_class_weights}")
     print(f"load_best_model_at_end = {load_best_model_at_end}")
-    print(f"class_weights = {class_weights.tolist()}")
 
     training_args = TrainingArguments(
         output_dir=output_dir,
@@ -284,15 +337,15 @@ def train_model(config: Any, model, tokenizer, tokenized_dataset):
         weight_decay=weight_decay,
         dataloader_num_workers=0,
         dataloader_pin_memory=False,
-        metric_for_best_model="f1_macro" if eval_dataset is not None else None,
+        metric_for_best_model=(
+            "f1_macro" if eval_dataset is not None and load_best_model_at_end else None
+        ),
         greater_is_better=True,
-        load_best_model_at_end=load_best_model_at_end if eval_dataset is not None else False,
+        load_best_model_at_end=(
+            load_best_model_at_end if eval_dataset is not None else False
+        ),
         save_total_limit=2,
     )
-
-    callbacks = []
-    if eval_dataset is not None and load_best_model_at_end:
-        callbacks.append(EarlyStoppingCallback(early_stopping_patience=early_stopping_patience))
 
     trainer = BalancedTrainer(
         model=model,
@@ -303,22 +356,26 @@ def train_model(config: Any, model, tokenizer, tokenized_dataset):
         data_collator=data_collator,
         compute_metrics=build_metrics_fn(id2label) if eval_dataset is not None else None,
         use_weighted_sampler=use_weighted_sampler,
+        use_class_weights=use_class_weights,
         train_labels=train_labels,
         num_classes=num_classes,
-        class_weights=class_weights,
-        callbacks=callbacks,
     )
 
     trainer.train()
 
     final_metrics = {}
+
     if eval_dataset is not None:
         final_metrics = trainer.evaluate()
-        print("\n[INFO] Evaluation metrics:")
-        for k, v in final_metrics.items():
-            print(f"{k}: {v}")
 
-        save_metrics_to_json(final_metrics, os.path.join(output_dir, "validation_metrics.json"))
+        print("\n[INFO] Evaluation metrics:")
+        for key, value in final_metrics.items():
+            print(f"{key}: {value}")
+
+        save_metrics_to_json(
+            final_metrics,
+            os.path.join(output_dir, "validation_metrics.json"),
+        )
 
     trainer.save_model(output_dir)
     tokenizer.save_pretrained(output_dir)

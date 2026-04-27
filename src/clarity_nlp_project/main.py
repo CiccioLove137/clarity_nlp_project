@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import json
+import os
 import random
 from typing import Any
 
@@ -8,6 +10,7 @@ import numpy as np
 import torch
 import yaml
 from datasets import Dataset, DatasetDict, load_dataset
+from sklearn.metrics import classification_report, confusion_matrix
 from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
 from src.clarity_nlp_project.data.splits import (
@@ -17,12 +20,7 @@ from src.clarity_nlp_project.data.splits import (
 from src.clarity_nlp_project.training.trainer import train_model
 
 
-SPECIAL_TOKENS = [
-    "<QUESTION>",
-    "</QUESTION>",
-    "<ANSWER>",
-    "</ANSWER>",
-]
+SPECIAL_TOKENS = ["<QUESTION>", "</QUESTION>", "<ANSWER>", "</ANSWER>"]
 
 
 def load_config(config_path: str) -> dict[str, Any]:
@@ -45,6 +43,7 @@ def set_seed(seed: int = 42) -> None:
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
+
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
@@ -63,7 +62,8 @@ def convert_split(raw_split) -> Dataset:
             continue
 
         label = str(label).strip()
-        if label == "":
+
+        if not label:
             continue
 
         if not question or not answer:
@@ -82,19 +82,44 @@ def convert_split(raw_split) -> Dataset:
     )
 
 
-def add_special_tokens_to_tokenizer(tokenizer) -> int:
-    special_tokens_dict = {
-        "additional_special_tokens": SPECIAL_TOKENS
-    }
+def build_text(question: str, answer: str) -> str:
+    return (
+        "<QUESTION>\n"
+        f"{question}\n"
+        "</QUESTION>\n\n"
+        "<ANSWER>\n"
+        f"{answer}\n"
+        "</ANSWER>"
+    )
 
-    num_added_tokens = tokenizer.add_special_tokens(special_tokens_dict)
 
-    print("\n[INFO] Added special tokens to tokenizer:")
-    print(f"special_tokens = {SPECIAL_TOKENS}")
-    print(f"num_added_tokens = {num_added_tokens}")
-    print(f"tokenizer_vocab_size = {len(tokenizer)}")
+def build_global_attention_mask(
+    input_ids: list[int],
+    tokenizer,
+    answer_global_tokens: int,
+) -> list[int]:
+    gam = [0] * len(input_ids)
 
-    return num_added_tokens
+    if len(gam) > 0:
+        gam[0] = 1
+
+    question_token_id = tokenizer.convert_tokens_to_ids("<QUESTION>")
+    answer_token_id = tokenizer.convert_tokens_to_ids("<ANSWER>")
+
+    for idx, token_id in enumerate(input_ids):
+        if token_id == question_token_id:
+            gam[idx] = 1
+
+        if token_id == answer_token_id:
+            gam[idx] = 1
+
+            start = idx + 1
+            end = min(idx + 1 + answer_global_tokens, len(gam))
+
+            for j in range(start, end):
+                gam[j] = 1
+
+    return gam
 
 
 def tokenize_split(
@@ -102,7 +127,7 @@ def tokenize_split(
     tokenizer,
     label2id: dict[str, int],
     max_length: int,
-    answer_global_tokens: int = 20,
+    answer_global_tokens: int,
 ) -> Dataset:
     texts = []
     labels = []
@@ -122,16 +147,9 @@ def tokenize_split(
         if label not in label2id:
             continue
 
-        combined_text = (
-            "<QUESTION>\n"
-            f"{question}\n"
-            "</QUESTION>\n\n"
-            "<ANSWER>\n"
-            f"{answer}\n"
-            "</ANSWER>"
-        )
+        text = build_text(question, answer)
 
-        texts.append(combined_text)
+        texts.append(text)
         labels.append(label2id[label])
 
     if len(texts) == 0:
@@ -144,34 +162,14 @@ def tokenize_split(
         max_length=max_length,
     )
 
-    question_token_id = tokenizer.convert_tokens_to_ids("<QUESTION>")
-    answer_token_id = tokenizer.convert_tokens_to_ids("<ANSWER>")
-
-    global_attention_mask = []
-
-    for input_ids in encoded["input_ids"]:
-        gam = [0] * len(input_ids)
-
-        # Token iniziale <s>
-        if len(gam) > 0:
-            gam[0] = 1
-
-        for i, token_id in enumerate(input_ids):
-            # Marker della domanda
-            if token_id == question_token_id:
-                gam[i] = 1
-
-            # Marker della risposta + primi token della risposta
-            if token_id == answer_token_id:
-                gam[i] = 1
-
-                start = i + 1
-                end = min(i + 1 + answer_global_tokens, len(gam))
-
-                for j in range(start, end):
-                    gam[j] = 1
-
-        global_attention_mask.append(gam)
+    global_attention_mask = [
+        build_global_attention_mask(
+            input_ids=input_ids,
+            tokenizer=tokenizer,
+            answer_global_tokens=answer_global_tokens,
+        )
+        for input_ids in encoded["input_ids"]
+    ]
 
     data = {
         "input_ids": encoded["input_ids"],
@@ -186,138 +184,145 @@ def tokenize_split(
     return Dataset.from_dict(data)
 
 
-def analyze_tokenized_split(split_name: str, tokenized_split: Dataset, max_length: int) -> None:
-    lengths = [len(input_ids) for input_ids in tokenized_split["input_ids"]]
-
-    num_examples = len(lengths)
-    min_len = min(lengths)
-    max_len = max(lengths)
-    avg_len = sum(lengths) / num_examples
-    num_at_max_length = sum(1 for length in lengths if length == max_length)
-    pct_at_max_length = 100.0 * num_at_max_length / num_examples
-
-    print(f"\n[CHECK] Token length statistics - {split_name}")
-    print(f"num_examples = {num_examples}")
-    print(f"min_len = {min_len}")
-    print(f"avg_len = {avg_len:.2f}")
-    print(f"max_len = {max_len}")
-    print(f"num_at_max_length = {num_at_max_length}")
-    print(f"pct_at_max_length = {pct_at_max_length:.2f}%")
-
-
-def check_global_attention_mask(split_name: str, tokenized_split: Dataset, n_examples: int = 5) -> None:
-    print(f"\n[CHECK] Global attention mask - {split_name}")
-
-    n_examples = min(n_examples, len(tokenized_split))
-
-    for i in range(n_examples):
-        gam = tokenized_split[i]["global_attention_mask"]
-        input_ids = tokenized_split[i]["input_ids"]
-
-        print(f"example_{i}:")
-        print(f"  input_len = {len(input_ids)}")
-        print(f"  gam_len = {len(gam)}")
-        print(f"  gam_sum = {sum(gam)}")
-        print(f"  first_40_gam = {gam[:40]}")
-
-        if len(gam) != len(input_ids):
-            print("  [WARNING] global_attention_mask length is different from input_ids length.")
-
-        if len(gam) > 0 and gam[0] != 1:
-            print("  [WARNING] first token does not have global attention.")
-
-        if sum(gam) < 1:
-            print("  [WARNING] no global attention tokens found.")
-
-
-def inspect_decoded_example(
-    dataset_split: Dataset,
-    tokenized_split: Dataset,
+def print_tokenizer_diagnostics(
     tokenizer,
-    split_name: str,
-    example_index: int = 0,
-    max_chars: int = 3000,
-) -> None:
-    if len(tokenized_split) == 0:
-        print(f"\n[CHECK] Cannot decode example from {split_name}: split is empty.")
-        return
-
-    example_index = min(example_index, len(tokenized_split) - 1)
-
-    original_text = (
-        "<QUESTION>\n"
-        f"{dataset_split[example_index]['question']}\n"
-        "</QUESTION>\n\n"
-        "<ANSWER>\n"
-        f"{dataset_split[example_index]['answer']}\n"
-        "</ANSWER>"
-    )
-
-    decoded_with_special_tokens = tokenizer.decode(
-        tokenized_split[example_index]["input_ids"],
-        skip_special_tokens=False,
-    )
-
-    decoded_without_special_tokens = tokenizer.decode(
-        tokenized_split[example_index]["input_ids"],
-        skip_special_tokens=True,
-    )
-
-    print(f"\n[CHECK] Decoded tokenization example - {split_name}")
-    print(f"example_index = {example_index}")
-    print(f"label_id = {tokenized_split[example_index]['labels']}")
-    print(f"tokenized_length = {len(tokenized_split[example_index]['input_ids'])}")
-
-    print("\n--- ORIGINAL TEXT ---")
-    print(original_text[:max_chars])
-
-    print("\n--- DECODED WITH SPECIAL TOKENS ---")
-    print(decoded_with_special_tokens[:max_chars])
-
-    print("\n--- DECODED WITHOUT SPECIAL TOKENS ---")
-    print(decoded_without_special_tokens[:max_chars])
-
-
-def check_special_token_ids(tokenizer) -> None:
-    print("\n[CHECK] Special token IDs")
-
-    for token in SPECIAL_TOKENS:
-        token_id = tokenizer.convert_tokens_to_ids(token)
-        print(f"{token} -> {token_id}")
-
-        if token_id == tokenizer.unk_token_id:
-            print(f"[WARNING] {token} is mapped to unk_token_id.")
-
-
-def run_tokenizer_checks(
-    dataset: DatasetDict,
     tokenized_dataset: DatasetDict,
-    tokenizer,
-    max_length: int,
+    original_dataset: DatasetDict,
 ) -> None:
     print("\n" + "=" * 80)
     print("[CHECK] TOKENIZER DIAGNOSTICS")
     print("=" * 80)
 
-    check_special_token_ids(tokenizer)
+    print("\n[CHECK] Special token IDs")
+    for token in SPECIAL_TOKENS:
+        print(f"{token} -> {tokenizer.convert_tokens_to_ids(token)}")
 
-    analyze_tokenized_split("train", tokenized_dataset["train"], max_length)
-    analyze_tokenized_split("validation", tokenized_dataset["validation"], max_length)
-    analyze_tokenized_split("test", tokenized_dataset["test"], max_length)
+    for split_name in ["train", "validation", "test"]:
+        lengths = [len(x) for x in tokenized_dataset[split_name]["input_ids"]]
 
-    check_global_attention_mask("train", tokenized_dataset["train"], n_examples=5)
+        print(f"\n[CHECK] Token length statistics - {split_name}")
+        print(f"num_examples = {len(lengths)}")
+        print(f"min_len = {min(lengths)}")
+        print(f"avg_len = {np.mean(lengths):.2f}")
+        print(f"max_len = {max(lengths)}")
+        print(f"num_at_max_length = {sum(1 for x in lengths if x == tokenizer.model_max_length)}")
+        print(
+            f"pct_at_max_length = "
+            f"{100 * sum(1 for x in lengths if x == tokenizer.model_max_length) / len(lengths):.2f}%"
+        )
 
-    inspect_decoded_example(
-        dataset_split=dataset["train"],
-        tokenized_split=tokenized_dataset["train"],
-        tokenizer=tokenizer,
-        split_name="train",
-        example_index=0,
-    )
+    print("\n[CHECK] Global attention mask - train")
+    for i in range(min(5, len(tokenized_dataset["train"]))):
+        input_len = len(tokenized_dataset["train"][i]["input_ids"])
+        gam = tokenized_dataset["train"][i]["global_attention_mask"]
+
+        print(f"example_{i}:")
+        print(f"  input_len = {input_len}")
+        print(f"  gam_len = {len(gam)}")
+        print(f"  gam_sum = {sum(gam)}")
+        print(f"  first_40_gam = {gam[:40]}")
+
+    print("\n[CHECK] Decoded tokenization example - train")
+
+    example_index = 0
+    input_ids = tokenized_dataset["train"][example_index]["input_ids"]
+    label_id = tokenized_dataset["train"][example_index]["labels"]
+
+    original_question = original_dataset["train"][example_index]["question"]
+    original_answer = original_dataset["train"][example_index]["answer"]
+    original_text = build_text(original_question, original_answer)
+
+    print(f"example_index = {example_index}")
+    print(f"label_id = {label_id}")
+    print(f"tokenized_length = {len(input_ids)}")
+
+    print("\n--- ORIGINAL TEXT ---")
+    print(original_text)
+
+    print("\n--- DECODED WITH SPECIAL TOKENS ---")
+    print(tokenizer.decode(input_ids, skip_special_tokens=False))
+
+    print("\n--- DECODED WITHOUT SPECIAL TOKENS ---")
+    print(tokenizer.decode(input_ids, skip_special_tokens=True))
 
     print("\n" + "=" * 80)
     print("[CHECK] TOKENIZER DIAGNOSTICS COMPLETED")
     print("=" * 80)
+
+
+def save_json(data: dict[str, Any], output_path: str) -> None:
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+
+    serializable = {}
+    for key, value in data.items():
+        if isinstance(value, (np.integer, np.floating)):
+            serializable[key] = float(value)
+        else:
+            serializable[key] = value
+
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(serializable, f, indent=2)
+
+
+def evaluate_with_confusion_matrix(
+    trainer,
+    eval_dataset: Dataset,
+    id2label: dict[int, str],
+    output_dir: str,
+    split_name: str = "test",
+) -> None:
+    print(f"\n[INFO] Computing predictions for {split_name.upper()} confusion matrix...")
+
+    prediction_output = trainer.predict(eval_dataset)
+
+    logits = prediction_output.predictions
+    labels = prediction_output.label_ids
+    preds = np.argmax(logits, axis=-1)
+
+    ordered_ids = sorted(id2label.keys())
+    label_names = [id2label[i] for i in ordered_ids]
+
+    cm = confusion_matrix(labels, preds, labels=ordered_ids)
+
+    print(f"\n[INFO] Confusion Matrix - {split_name.upper()}:")
+    print(cm)
+
+    report = classification_report(
+        labels,
+        preds,
+        labels=ordered_ids,
+        target_names=label_names,
+        digits=4,
+        zero_division=0,
+    )
+
+    print(f"\n[INFO] Classification Report - {split_name.upper()}:")
+    print(report)
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    cm_path = os.path.join(output_dir, f"{split_name}_confusion_matrix.txt")
+    report_path = os.path.join(output_dir, f"{split_name}_classification_report.txt")
+    predictions_path = os.path.join(output_dir, f"{split_name}_predictions.json")
+
+    with open(cm_path, "w", encoding="utf-8") as f:
+        f.write(str(cm))
+
+    with open(report_path, "w", encoding="utf-8") as f:
+        f.write(report)
+
+    predictions_data = {
+        "labels": labels.tolist(),
+        "predictions": preds.tolist(),
+        "label_names": label_names,
+    }
+
+    with open(predictions_path, "w", encoding="utf-8") as f:
+        json.dump(predictions_data, f, indent=2)
+
+    print(f"\n[INFO] Saved confusion matrix to: {cm_path}")
+    print(f"[INFO] Saved classification report to: {report_path}")
+    print(f"[INFO] Saved predictions to: {predictions_path}")
 
 
 def main() -> None:
@@ -340,6 +345,7 @@ def main() -> None:
     model_name = get_cfg(config, "model.name", "allenai/longformer-base-4096")
     max_length = int(get_cfg(config, "dataset.max_length", 4096))
     val_size = float(get_cfg(config, "dataset.val_size", 0.1))
+    output_dir = get_cfg(config, "training.output_dir", "outputs")
     answer_global_tokens = int(get_cfg(config, "dataset.answer_global_tokens", 20))
 
     print("\n[INFO] Loading raw dataset...")
@@ -375,6 +381,7 @@ def main() -> None:
     print_split_info(dataset, "test", "label")
 
     print("\n[INFO] Checking empty fields...")
+
     empty_train_q = sum(1 for x in dataset["train"]["question"] if not str(x).strip())
     empty_val_q = sum(1 for x in dataset["validation"]["question"] if not str(x).strip())
     empty_test_q = sum(1 for x in dataset["test"]["question"] if not str(x).strip())
@@ -396,6 +403,7 @@ def main() -> None:
         | set(dataset["validation"]["label"])
         | set(dataset["test"]["label"])
     )
+
     label2id = {label: idx for idx, label in enumerate(unique_labels)}
     id2label = {idx: label for label, idx in label2id.items()}
 
@@ -404,7 +412,15 @@ def main() -> None:
 
     print("\n[INFO] Loading tokenizer...")
     tokenizer = AutoTokenizer.from_pretrained(model_name)
-    num_added_tokens = add_special_tokens_to_tokenizer(tokenizer)
+
+    added_tokens = tokenizer.add_special_tokens(
+        {"additional_special_tokens": SPECIAL_TOKENS}
+    )
+
+    print("\n[INFO] Added special tokens to tokenizer:")
+    print(f"special_tokens = {SPECIAL_TOKENS}")
+    print(f"num_added_tokens = {added_tokens}")
+    print(f"tokenizer_vocab_size = {len(tokenizer)}")
 
     print(f"\n[INFO] answer_global_tokens = {answer_global_tokens}")
 
@@ -414,7 +430,7 @@ def main() -> None:
         tokenizer,
         label2id,
         max_length,
-        answer_global_tokens=answer_global_tokens,
+        answer_global_tokens,
     )
 
     print("\n[INFO] Tokenizing validation split...")
@@ -423,7 +439,7 @@ def main() -> None:
         tokenizer,
         label2id,
         max_length,
-        answer_global_tokens=answer_global_tokens,
+        answer_global_tokens,
     )
 
     print("\n[INFO] Tokenizing test split...")
@@ -432,7 +448,7 @@ def main() -> None:
         tokenizer,
         label2id,
         max_length,
-        answer_global_tokens=answer_global_tokens,
+        answer_global_tokens,
     )
 
     tokenized_dataset = DatasetDict(
@@ -457,11 +473,10 @@ def main() -> None:
     print("validation:", set(tokenized_dataset["validation"]["labels"]))
     print("test:", set(tokenized_dataset["test"]["labels"]))
 
-    run_tokenizer_checks(
-        dataset=dataset,
-        tokenized_dataset=tokenized_dataset,
+    print_tokenizer_diagnostics(
         tokenizer=tokenizer,
-        max_length=max_length,
+        tokenized_dataset=tokenized_dataset,
+        original_dataset=dataset,
     )
 
     num_labels = len(label2id)
@@ -474,10 +489,9 @@ def main() -> None:
         label2id=label2id,
     )
 
-    if num_added_tokens > 0:
-        print("\n[INFO] Resizing model token embeddings...")
-        model.resize_token_embeddings(len(tokenizer))
-        print(f"[INFO] New embedding size = {len(tokenizer)}")
+    print("\n[INFO] Resizing model token embeddings...")
+    model.resize_token_embeddings(len(tokenizer))
+    print(f"[INFO] New embedding size = {len(tokenizer)}")
 
     print("[INFO] Model loaded successfully!")
 
@@ -490,6 +504,16 @@ def main() -> None:
     print("\n[INFO] Final TEST metrics:")
     for key, value in test_metrics.items():
         print(f"{key}: {value}")
+
+    save_json(test_metrics, os.path.join(output_dir, "test_metrics.json"))
+
+    evaluate_with_confusion_matrix(
+        trainer=trainer,
+        eval_dataset=tokenized_dataset["test"],
+        id2label=id2label,
+        output_dir=output_dir,
+        split_name="test",
+    )
 
     print("\n[INFO] Pipeline completed successfully!")
 
