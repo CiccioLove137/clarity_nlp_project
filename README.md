@@ -1,170 +1,245 @@
-Clarity NLP Project
-Political Response Clarity Classification with Longformer
-Overview
+# Clarity NLP Project – Political Response Classification with Longformer
 
-This project focuses on the automatic classification of political interview responses according to their level of clarity.
+Questo progetto implementa una pipeline completa di Natural Language Processing per la classificazione della chiarezza delle risposte politiche utilizzando il modello **Longformer-base-4096**.
 
-The task consists of assigning one of the following labels to a question-answer pair:
+L'obiettivo è classificare una coppia **domanda-risposta** in una delle seguenti categorie:
 
-Ambivalent – ambiguous response
-Clear Non-Reply – evasive response
-Clear Reply – direct and relevant response
+* **Clear Reply**
+* **Clear Non-Reply**
+* **Ambivalent**
 
-The project uses the Longformer architecture to process long textual sequences while leveraging global attention mechanisms to emphasize relevant parts of the input.
+Il progetto utilizza il dataset **QEvasion** e sfrutta la capacità del Longformer di gestire sequenze lunghe mantenendo il contesto completo dell'interazione.
 
-Dataset
+---
 
-Dataset used:
+## Struttura del progetto
 
+```bash
+clarity_nlp_project/
+│
+├── configs/
+│   ├── data/
+│   │   └── clarity.yaml
+│   ├── model/
+│   ├── training/
+│   └── default.yaml
+│
+├── data/
+│   ├── interim/
+│   └── processed/
+│
+├── models/
+│   ├── checkpoints/
+│   └── final/
+│
+├── reports/
+│
+├── src/
+│   └── clarity_nlp_project/
+│       ├── data/
+│       │   ├── loader.py
+│       │   ├── preprocess.py
+│       │   ├── splits.py
+│       │   └── tokenizer_utils.py
+│       │
+│       ├── models/
+│       │   └── hf_classifier.py
+│       │
+│       ├── training/
+│       │   └── trainer.py
+│       │
+│       ├── __init__.py
+│       └── main.py
+│
+├── requirements.txt
+├── pyproject.toml
+└── README.md
+```
+
+---
+
+## Dataset
+
+Il progetto utilizza il dataset:
+
+```bash
 ailsntua/QEvasion
+```
 
-Source:
-https://huggingface.co/datasets/ailsntua/QEvasion
+contenente interviste presidenziali annotate secondo il livello di chiarezza delle risposte.
 
-Dataset Statistics
-Split	Samples
-Train	3103
-Validation	345
-Test	308
-Class Distribution (Train)
-Label	Samples	Percentage
-Ambivalent	1836	59.17%
-Clear Non-Reply	320	10.31%
-Clear Reply	947	30.52%
-Project Pipeline
+Le classi considerate sono:
 
-The complete workflow consists of:
+| Classe          | Descrizione                                |
+| --------------- | ------------------------------------------ |
+| Clear Reply     | Risposta diretta e pertinente              |
+| Clear Non-Reply | Risposta evasiva                           |
+| Ambivalent      | Risposta parzialmente pertinente o ambigua |
 
-Dataset loading
-Data cleaning
-Train/validation/test split
-Tokenization
-Construction of Global Attention Masks
-Longformer fine-tuning
-Validation
-Test evaluation
-Confusion Matrix generation
-Classification Report generation
-Model
+---
 
-Pretrained model:
+## Preprocessing
 
+Ogni esempio viene convertito nel formato:
+
+```text
+<QUESTION>
+Question text
+</QUESTION>
+
+<ANSWER>
+Answer text
+</ANSWER>
+```
+
+Per migliorare la separazione semantica tra domanda e risposta vengono introdotti token speciali:
+
+```text
+<QUESTION>
+</QUESTION>
+<ANSWER>
+</ANSWER>
+```
+
+Successivamente il testo viene tokenizzato utilizzando il tokenizer del Longformer.
+
+---
+
+## Modello
+
+Il classificatore è basato su:
+
+```bash
 allenai/longformer-base-4096
-Why Longformer?
+```
 
-Unlike standard Transformer architectures, Longformer can efficiently process long documents through:
+Longformer è una variante dei Transformer progettata per gestire documenti lunghi tramite un meccanismo di attenzione locale e globale, riducendo il costo computazionale rispetto alla self-attention standard.
 
-Local Attention
-Global Attention
+---
 
-Maximum sequence length:
+## Global Attention
 
-4096 tokens
-Input Representation
+Per sfruttare le caratteristiche del Longformer viene utilizzata una strategia di attenzione globale sui token più informativi:
 
-Question-answer pairs are encoded using custom special tokens:
+* token iniziale della sequenza
+* token `<QUESTION>`
+* token `<ANSWER>`
+* primi token della risposta
 
-<QUESTION>
-...
-</QUESTION>
+Questa configurazione consente al modello di concentrarsi sulle parti più rilevanti dell'interazione domanda-risposta.
 
-<ANSWER>
-...
-</ANSWER>
+---
 
-Example:
+## Bilanciamento delle classi
 
-<QUESTION>
-What is your position on climate policy?
-</QUESTION>
+Poiché il dataset presenta una distribuzione sbilanciata delle classi, durante il training vengono utilizzate tecniche di riequilibrio:
 
-<ANSWER>
-We are currently evaluating several alternatives...
-</ANSWER>
-Global Attention Strategy
+* Weighted Random Sampling
+* Class Weights nella funzione di loss
 
-To improve classification performance, global attention is assigned to:
+L'obiettivo è ridurre il bias verso la classe maggioritaria.
 
-special tokens
-first answer tokens
+---
 
-Configuration:
+## Pipeline generale
 
-answer_global_tokens = 20
+```bash
+dataset
+   ↓
+preprocessing
+   ↓
+tokenization
+   ↓
+global attention masks
+   ↓
+train / validation split
+   ↓
+training
+   ↓
+evaluation
+```
 
-This allows the model to focus on the most informative parts of the response.
+---
 
-Training Configuration
+## Addestramento
 
-Main hyperparameters:
+L'addestramento viene gestito tramite il modulo:
 
-learning_rate: 2e-5
-per_device_train_batch_size: 1
-gradient_accumulation_steps: 8
-num_train_epochs: 5
-weight_decay: 0.01
-warmup_steps: 100
-Effective Batch Size
-1 × 8 = 8
+```bash
+src/clarity_nlp_project/training/trainer.py
+```
 
-Gradient accumulation is used to simulate larger batches while keeping GPU memory consumption manageable.
+La configurazione degli esperimenti è centralizzata nei file presenti nella cartella:
 
-Class Imbalance Handling
+```bash
+configs/
+```
 
-The dataset is highly imbalanced.
+consentendo di modificare facilmente:
 
-To address this issue, two techniques were employed:
+* learning rate
+* batch size
+* numero di epoche
+* gradient accumulation
+* warmup
+* weight decay
 
-WeightedRandomSampler
+---
 
-Oversamples minority classes during training.
+## Avvio del progetto
 
-Class Weights
+Installazione delle dipendenze:
 
-Loss function weights:
+```bash
+pip install -r requirements.txt
+```
 
-Ambivalent       = 0.56
-Clear Non-Reply  = 3.23
-Clear Reply      = 1.09
-Results
-Validation Set
-Metric	Score
-Accuracy	0.684
-Macro F1	0.672
-Weighted F1	0.687
-Test Set
-Metric	Score
-Accuracy	0.675
-Macro F1	0.619
-Weighted F1	0.683
-Test Classification Report
-Class	Precision	Recall	F1
-Ambivalent	0.809	0.718	0.761
-Clear Non-Reply	0.486	0.739	0.586
-Clear Reply	0.478	0.544	0.509
-Confusion Matrix
-[[148  12  46]
- [  5  17   1]
- [ 30   6  43]]
-Future Improvements
+Esecuzione del training:
 
-Possible future developments include:
+```bash
+python -m src.clarity_nlp_project.main
+```
 
-Hyperparameter optimization
-Data augmentation techniques
-Ensemble methods
-Comparison with other Transformer architectures
-Instruction-tuned Large Language Models
-Technologies Used
-Python
-PyTorch
-Hugging Face Transformers
-Hugging Face Datasets
-Longformer
-Scikit-learn
-NumPy
-Author
+---
 
-Francesco Lo Vetri
+## Output
+
+Durante l'esecuzione vengono generati:
+
+```bash
+models/checkpoints/
+```
+
+contenente i checkpoint intermedi del modello,
+
+e
+
+```bash
+models/final/
+```
+
+contenente il modello finale addestrato.
+
+Le metriche e i report degli esperimenti vengono salvati nella cartella:
+
+```bash
+reports/
+```
+
+---
+
+## Obiettivo del progetto
+
+Questo lavoro esplora l'utilizzo di modelli Transformer per il riconoscimento automatico di risposte evasive in ambito politico.
+
+L'uso del Longformer permette di mantenere il contesto completo delle interazioni domanda-risposta e rappresenta una soluzione efficace per compiti di classificazione testuale basati su sequenze lunghe.
+
+---
+
+## Autore
+
+**Francesco Lo Vetri**
 
 Master's Degree in Artificial Intelligence and Cybersecurity
+
+University of Enna "Kore"
