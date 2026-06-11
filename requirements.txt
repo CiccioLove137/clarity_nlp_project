@@ -1,0 +1,17 @@
+torch
+transformers
+datasets
+accelerate
+
+numpy
+pandas
+scikit-learn
+
+pyyaml
+tqdm
+
+huggingface-hub
+evaluate
+
+matplotlib
+seaborn
